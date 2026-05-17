@@ -12,10 +12,10 @@ tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["macros"] }
 tower-http = { version = "0.5", features = ["cors"] }
 
-# rmcp với đúng macros
+# "macros" bao gồm tool, tool_router, tool_handler
+# "server" bao gồm ServerHandler, ToolRouter, wrapper::Parameters
 rmcp = { version = "0.16", features = ["server", "transport-io", "macros"] }
 
-# rustls để tránh OpenSSL trên windows-gnu
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",

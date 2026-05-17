@@ -7,7 +7,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::IntoResponse,
-    routing::{get, post},
+    routing::get,
 };
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
