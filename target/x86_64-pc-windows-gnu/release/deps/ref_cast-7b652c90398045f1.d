@@ -1,0 +1,14 @@
+/workspaces/roblox-mcp/target/x86_64-pc-windows-gnu/release/deps/ref_cast-7b652c90398045f1.d: /home/codespace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.25/src/lib.rs /home/codespace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.25/src/custom.rs /home/codespace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.25/src/layout.rs /home/codespace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.25/src/trivial.rs /home/codespace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.25/src/private.rs /workspaces/roblox-mcp/target/x86_64-pc-windows-gnu/release/build/ref-cast-babaec39dce0a6f2/out/private.rs
+
+/workspaces/roblox-mcp/target/x86_64-pc-windows-gnu/release/deps/libref_cast-7b652c90398045f1.rlib: /home/codespace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.25/src/lib.rs /home/codespace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.25/src/custom.rs /home/codespace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.25/src/layout.rs /home/codespace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.25/src/trivial.rs /home/codespace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.25/src/private.rs /workspaces/roblox-mcp/target/x86_64-pc-windows-gnu/release/build/ref-cast-babaec39dce0a6f2/out/private.rs
+
+/workspaces/roblox-mcp/target/x86_64-pc-windows-gnu/release/deps/libref_cast-7b652c90398045f1.rmeta: /home/codespace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.25/src/lib.rs /home/codespace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.25/src/custom.rs /home/codespace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.25/src/layout.rs /home/codespace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.25/src/trivial.rs /home/codespace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.25/src/private.rs /workspaces/roblox-mcp/target/x86_64-pc-windows-gnu/release/build/ref-cast-babaec39dce0a6f2/out/private.rs
+
+/home/codespace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.25/src/lib.rs:
+/home/codespace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.25/src/custom.rs:
+/home/codespace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.25/src/layout.rs:
+/home/codespace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.25/src/trivial.rs:
+/home/codespace/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ref-cast-1.0.25/src/private.rs:
+/workspaces/roblox-mcp/target/x86_64-pc-windows-gnu/release/build/ref-cast-babaec39dce0a6f2/out/private.rs:
+
+# env-dep:OUT_DIR=/workspaces/roblox-mcp/target/x86_64-pc-windows-gnu/release/build/ref-cast-babaec39dce0a6f2/out
