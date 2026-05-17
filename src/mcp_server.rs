@@ -1,176 +1,189 @@
-/// mcp_server.rs
-/// Định nghĩa các tools Claude có thể gọi để điều khiển Roblox Studio
+/// mcp_server.rs — MCP tools cho Roblox Studio
+/// Tool snapshot() trả toàn bộ context 1 lần, batch_run() gộp nhiều lệnh
 
 use crate::bridge::{BridgeState, CommandKind};
-use anyhow::Result;
 use rmcp::{
+    ErrorData as McpError,
+    handler::server::tool::ToolRouter,
+    model::{CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo},
+    schemars,
+    tool, tool_handler, tool_router,
     ServerHandler,
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
-    tool, tool_box, tool_handler,
 };
-use schemars::JsonSchema;
-use serde::Deserialize;
 
-// ── Tham số cho từng tool ──────────────────────────────────────────
+// ── Params ────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RunCodeParams {
-    #[schemars(description = "Luau code để chạy trong Roblox Studio. Ví dụ: print('Hello')")]
+    #[schemars(description = "Luau code để chạy trong Studio")]
     pub code: String,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct GetInstancesParams {
-    #[schemars(
-        description = "Path trong DataModel. Ví dụ: 'game.Workspace', 'game.ServerStorage', 'game'"
-    )]
+    #[schemars(description = "Path trong DataModel. Ví dụ: 'game.Workspace'")]
     pub path: String,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct InsertPartParams {
-    #[schemars(description = "Tên của Part mới")]
+    #[schemars(description = "Tên Part")]
     pub name: String,
     #[schemars(description = "Parent path. Ví dụ: 'game.Workspace'")]
     pub parent: String,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct InsertScriptParams {
     #[schemars(description = "Tên script")]
     pub name: String,
-    #[schemars(description = "Loại script: 'Script', 'LocalScript', 'ModuleScript'")]
+    #[schemars(description = "Loại: 'Script', 'LocalScript', 'ModuleScript'")]
     pub script_type: String,
-    #[schemars(description = "Parent path. Ví dụ: 'game.ServerScriptService'")]
+    #[schemars(description = "Parent path")]
     pub parent: String,
-    #[schemars(description = "Nội dung source code của script")]
+    #[schemars(description = "Source code")]
     pub source: String,
 }
 
-// ── MCP Server implementation ──────────────────────────────────────
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct BatchRunParams {
+    #[schemars(description = "Danh sách Luau code chạy tuần tự. Mỗi item là 1 đoạn code độc lập.")]
+    pub codes: Vec<String>,
+}
+
+// ── Server ────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct RobloxMcpServer {
-    bridge: BridgeState,
+    pub bridge: BridgeState,
+    tool_router: ToolRouter<Self>,
 }
 
-#[tool_box]
+#[tool_router]
 impl RobloxMcpServer {
     pub fn new(bridge: BridgeState) -> Self {
-        Self { bridge }
+        Self { bridge, tool_router: Self::tool_router() }
     }
 
-    // ── Tool: chạy Luau code tùy ý ──────────────────────────────
+    // ── snapshot: 1 call trả hết context ────────────────────────
 
-    #[tool(description = "Chạy Luau code tùy ý trong Roblox Studio và trả về output. \
-        Dùng để test logic, tạo objects, sửa properties, v.v.")]
+    #[tool(description = "\
+        Lấy toàn bộ context của game trong 1 lần gọi: \
+        danh sách instances (Workspace/SSS/RS/StarterGui), \
+        tất cả scripts kèm source code, và version Studio. \
+        LUÔN gọi tool này đầu tiên trước khi làm bất cứ điều gì khác. \
+        Trả JSON với các key: version, services, scripts.")]
+    async fn snapshot(&self) -> Result<CallToolResult, McpError> {
+        let result = self
+            .bridge
+            .send_command(CommandKind::Snapshot {})
+            .await
+            .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"));
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    // ── batch_run: gộp nhiều lệnh thành 1 round-trip ────────────
+
+    #[tool(description = "\
+        Chạy nhiều đoạn Luau code tuần tự trong 1 lần gọi duy nhất. \
+        Dùng thay cho nhiều lần gọi run_code riêng lẻ để tiết kiệm token. \
+        Trả về output của từng đoạn code theo thứ tự.")]
+    async fn batch_run(
+        &self,
+        #[tool(aggr)] params: BatchRunParams,
+    ) -> Result<CallToolResult, McpError> {
+        let result = self
+            .bridge
+            .send_command(CommandKind::BatchRun { codes: params.codes })
+            .await
+            .unwrap_or_else(|e| format!("❌ {e}"));
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    // ── run_code ─────────────────────────────────────────────────
+
+    #[tool(description = "\
+        Chạy 1 đoạn Luau code trong Studio. \
+        Nếu cần chạy nhiều thao tác, dùng batch_run() thay thế để tiết kiệm token.")]
     async fn run_code(
         &self,
         #[tool(aggr)] params: RunCodeParams,
-    ) -> Result<CallToolResult, rmcp::Error> {
-        match self.bridge.send_command(CommandKind::RunCode { code: params.code }).await {
-            Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
-            Err(e) => Ok(CallToolResult::success(vec![
-                Content::text(format!("❌ Lỗi: {e}"))
-            ])),
-        }
+    ) -> Result<CallToolResult, McpError> {
+        let r = self
+            .bridge
+            .send_command(CommandKind::RunCode { code: params.code })
+            .await
+            .unwrap_or_else(|e| format!("❌ {e}"));
+        Ok(CallToolResult::success(vec![Content::text(r)]))
     }
 
-    // ── Tool: xem cây instances ──────────────────────────────────
+    // ── get_instances ─────────────────────────────────────────────
 
-    #[tool(description = "Xem danh sách con (children) của một object trong DataModel. \
-        Trả về tên và ClassName của từng child. \
-        Ví dụ path: 'game', 'game.Workspace', 'game.ServerStorage'")]
+    #[tool(description = "Xem children của 1 object. Dùng snapshot() nếu cần xem tổng thể.")]
     async fn get_instances(
         &self,
         #[tool(aggr)] params: GetInstancesParams,
-    ) -> Result<CallToolResult, rmcp::Error> {
-        match self.bridge.send_command(CommandKind::GetInstances { path: params.path }).await {
-            Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
-            Err(e) => Ok(CallToolResult::success(vec![
-                Content::text(format!("❌ Lỗi: {e}"))
-            ])),
-        }
+    ) -> Result<CallToolResult, McpError> {
+        let r = self
+            .bridge
+            .send_command(CommandKind::GetInstances { path: params.path })
+            .await
+            .unwrap_or_else(|e| format!("❌ {e}"));
+        Ok(CallToolResult::success(vec![Content::text(r)]))
     }
 
-    // ── Tool: tạo Part ──────────────────────────────────────────
+    // ── insert_part ───────────────────────────────────────────────
 
-    #[tool(description = "Tạo một Part mới trong Roblox Studio Workspace. \
-        Part sẽ xuất hiện ngay trong viewport của Studio.")]
+    #[tool(description = "Tạo Part mới. Hoặc dùng run_code() để tạo kèm properties luôn.")]
     async fn insert_part(
         &self,
         #[tool(aggr)] params: InsertPartParams,
-    ) -> Result<CallToolResult, rmcp::Error> {
-        match self.bridge.send_command(CommandKind::InsertPart {
-            name: params.name,
-            parent: params.parent,
-        }).await {
-            Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
-            Err(e) => Ok(CallToolResult::success(vec![
-                Content::text(format!("❌ Lỗi: {e}"))
-            ])),
-        }
+    ) -> Result<CallToolResult, McpError> {
+        let r = self
+            .bridge
+            .send_command(CommandKind::InsertPart { name: params.name, parent: params.parent })
+            .await
+            .unwrap_or_else(|e| format!("❌ {e}"));
+        Ok(CallToolResult::success(vec![Content::text(r)]))
     }
 
-    // ── Tool: tạo Script ────────────────────────────────────────
+    // ── insert_script ─────────────────────────────────────────────
 
-    #[tool(description = "Tạo Script/LocalScript/ModuleScript trong Roblox Studio \
-        với source code được cung cấp. \
-        script_type: 'Script' (server), 'LocalScript' (client), 'ModuleScript'")]
+    #[tool(description = "Tạo Script/LocalScript/ModuleScript với source code.")]
     async fn insert_script(
         &self,
         #[tool(aggr)] params: InsertScriptParams,
-    ) -> Result<CallToolResult, rmcp::Error> {
-        // Tạo script bằng Luau code
+    ) -> Result<CallToolResult, McpError> {
         let code = format!(
-            r#"
-local parent = {}
-local script = Instance.new("{}")
-script.Name = "{}"
-script.Source = [[{}]]
-script.Parent = parent
-print("Created script: " .. script.Name .. " in " .. parent:GetFullName())
-"#,
-            params.parent,
-            params.script_type,
-            params.name,
-            params.source.replace("]]", "]] .. \"]]\" .. [["), // escape
+            "local s=Instance.new(\"{t}\")\ns.Name=\"{n}\"\ns.Source=[=[{src}]=]\ns.Parent={p}\nprint(\"✅ \"..s.Name)",
+            t = params.script_type,
+            n = params.name,
+            src = params.source,
+            p = params.parent,
         );
-
-        match self.bridge.send_command(CommandKind::RunCode { code }).await {
-            Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
-            Err(e) => Ok(CallToolResult::success(vec![
-                Content::text(format!("❌ Lỗi: {e}"))
-            ])),
-        }
+        let r = self
+            .bridge
+            .send_command(CommandKind::RunCode { code })
+            .await
+            .unwrap_or_else(|e| format!("❌ {e}"));
+        Ok(CallToolResult::success(vec![Content::text(r)]))
     }
 
-    // ── Tool: lấy danh sách scripts ─────────────────────────────
+    // ── status ────────────────────────────────────────────────────
 
-    #[tool(description = "Lấy danh sách tất cả Scripts trong game, kèm theo source code. \
-        Hữu ích để Claude đọc hiểu codebase hiện tại.")]
-    async fn get_scripts(&self) -> Result<CallToolResult, rmcp::Error> {
-        match self.bridge.send_command(CommandKind::GetScripts {}).await {
-            Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
-            Err(e) => Ok(CallToolResult::success(vec![
-                Content::text(format!("❌ Lỗi: {e}"))
-            ])),
-        }
-    }
-
-    // ── Tool: status ────────────────────────────────────────────
-
-    #[tool(description = "Kiểm tra trạng thái kết nối với Roblox Studio plugin")]
-    async fn status(&self) -> Result<CallToolResult, rmcp::Error> {
-        let code = r#"print("✅ Roblox Studio connected! Version: " .. tostring(version()))"#.to_string();
-        match self.bridge.send_command(CommandKind::RunCode { code }).await {
-            Ok(output) => Ok(CallToolResult::success(vec![Content::text(
-                format!("🟢 Studio connected\n{output}")
-            )])),
-            Err(_) => Ok(CallToolResult::success(vec![Content::text(
-                "🔴 Studio plugin chưa kết nối. Mở Roblox Studio và bật plugin MCP.".to_string()
-            )])),
-        }
+    #[tool(description = "Kiểm tra nhanh kết nối plugin. snapshot() đã bao gồm thông tin này.")]
+    async fn status(&self) -> Result<CallToolResult, McpError> {
+        let r = self
+            .bridge
+            .send_command(CommandKind::RunCode {
+                code: r#"print("✅ "..tostring(version()))"#.to_string(),
+            })
+            .await;
+        let msg = match r {
+            Ok(o) => format!("🟢 Connected\n{o}"),
+            Err(e) => format!("🔴 Not connected\n{e}"),
+        };
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 }
 
@@ -178,20 +191,18 @@ print("Created script: " .. script.Name .. " in " .. parent:GetFullName())
 impl ServerHandler for RobloxMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
+            protocol_version: ProtocolVersion::V_2024_11_05,
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            server_info: Implementation {
+                name: "roblox-studio-mcp".into(),
+                version: "0.1.0".into(),
+            },
             instructions: Some(
-                "Roblox Studio MCP Server. Dùng các tools để:\n\
-                - run_code: Chạy Luau code trong Studio\n\
-                - get_instances: Xem cấu trúc DataModel\n\
-                - insert_part: Tạo Part mới\n\
-                - insert_script: Tạo Script với code\n\
-                - get_scripts: Đọc scripts hiện có\n\
-                - status: Kiểm tra kết nối\n\
-                Luôn gọi status() trước khi dùng các tool khác.".into()
+                "QUAN TRỌNG: Luôn gọi snapshot() ĐẦU TIÊN để lấy toàn bộ context game. \
+                Gộp nhiều thao tác vào batch_run() hoặc 1 run_code() duy nhất thay vì gọi nhiều lần. \
+                Tools: snapshot, batch_run, run_code, get_instances, insert_part, insert_script, status."
+                    .into(),
             ),
-            capabilities: ServerCapabilities::builder()
-                .enable_tools()
-                .build(),
-            ..Default::default()
         }
     }
 }

@@ -8,56 +8,30 @@ name = "roblox-mcp"
 path = "src/main.rs"
 
 [dependencies]
-# Async runtime
 tokio = { version = "1", features = ["full"] }
-
-# Web framework cho MCP HTTP server
 axum = { version = "0.7", features = ["macros"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.5", features = ["cors"] }
 
-# MCP protocol — official Rust SDK
-rmcp = { version = "0.16", features = [
-    "server",
-    "transport-io",
-    "macros",
-] }
+# rmcp với đúng macros
+rmcp = { version = "0.16", features = ["server", "transport-io", "macros"] }
 
-# HTTP client — dùng rustls thay vì native-tls để tránh phụ thuộc OpenSSL
-# (quan trọng với x86_64-pc-windows-gnu)
+# rustls để tránh OpenSSL trên windows-gnu
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
-    "rustls-tls",   # không cần OpenSSL, link tĩnh được
+    "rustls-tls",
     "stream",
 ] }
 
-# Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-# Error handling
 anyhow = "1"
-thiserror = "1"
-
-# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# UUID cho session
 uuid = { version = "1", features = ["v4"] }
-
-# Async utilities
-tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
 
 [profile.release]
 opt-level = 3
-lto = true          # Link Time Optimization — giảm size binary
-codegen-units = 1   # Tối ưu hơn nhưng compile chậm hơn
-strip = true        # Bỏ debug symbols — giảm size đáng kể
-
-# Profile riêng cho cross-compile (nhanh hơn khi dev)
-[profile.release-windows]
-inherits = "release"
-lto = false
-codegen-units = 4
+lto = true
+codegen-units = 1
+strip = true
