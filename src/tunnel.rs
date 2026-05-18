@@ -1,4 +1,5 @@
-/// tunnel.rs — Tự download cloudflared nếu chưa có, rồi spawn tunnel
+/// tunnel.rs — Tìm cloudflared.exe và spawn quick tunnel
+/// Tải cloudflared tại: https://github.com/cloudflare/cloudflared/releases/latest
 
 use crate::Config;
 use anyhow::{Context, Result};
@@ -6,17 +7,7 @@ use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::info;
 
-#[cfg(target_os = "windows")]
-const CF_URL: &str =
-    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe";
-#[cfg(target_os = "linux")]
-const CF_URL: &str =
-    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64";
-#[cfg(target_os = "macos")]
-const CF_URL: &str =
-    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64";
-
-async fn get_cloudflared() -> Result<PathBuf> {
+fn find_cloudflared() -> Result<PathBuf> {
     let dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -29,64 +20,42 @@ async fn get_cloudflared() -> Result<PathBuf> {
 
     let path = dir.join(name);
     if path.exists() {
-        info!("cloudflared found: {}", path.display());
-        return Ok(path);
+        info!("Found cloudflared: {}", path.display());
+        Ok(path)
+    } else {
+        anyhow::bail!(
+            "Không tìm thấy {name} cạnh roblox-mcp.exe!\n\
+            Tải tại: https://github.com/cloudflare/cloudflared/releases/latest\n\
+            File: cloudflared-windows-amd64.exe → đổi tên thành cloudflared.exe\n\
+            Đặt cạnh roblox-mcp.exe rồi chạy lại."
+        )
     }
-
-    info!("Downloading cloudflared (~30MB)...");
-    let bytes = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()?
-        .get(CF_URL)
-        .send()
-        .await
-        .context("Download failed")?
-        .bytes()
-        .await?;
-
-    tokio::fs::write(&path, &bytes).await?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut p = tokio::fs::metadata(&path).await?.permissions();
-        p.set_mode(0o755);
-        tokio::fs::set_permissions(&path, p).await?;
-    }
-
-    info!("Downloaded ({} MB)", bytes.len() / 1024 / 1024);
-    Ok(path)
 }
 
 pub async fn start_tunnel(config: &Config) -> Result<String> {
-    let cf = get_cloudflared().await?;
+    let cf   = find_cloudflared()?;
     let port = config.mcp_port;
 
-    let mut cmd = if let Some(token) = &config.cf_tunnel_token {
-        info!("Named tunnel (URL cố định)...");
-        let mut c = tokio::process::Command::new(&cf);
-        c.args(["tunnel", "--no-autoupdate", "run", "--token", token]);
-        c
-    } else {
-        info!("Quick tunnel (URL random)...");
-        let mut c = tokio::process::Command::new(&cf);
-        c.args(["tunnel", "--no-autoupdate", "--url", &format!("http://localhost:{port}")]);
-        c
-    };
+    info!("Quick tunnel → http://localhost:{port}");
 
-    cmd.stdout(std::process::Stdio::piped())
+    let mut child = tokio::process::Command::new(&cf)
+        .args(["tunnel", "--no-autoupdate", "--url", &format!("http://localhost:{port}")])
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+        .kill_on_drop(true)
+        .spawn()
+        .context("Failed to spawn cloudflared")?;
 
-    let mut child = cmd.spawn().context("Failed to spawn cloudflared")?;
     let stderr = child.stderr.take().unwrap();
     let stdout = child.stdout.take().unwrap();
 
+    // Drain stdout
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(_)) = lines.next_line().await {}
     });
 
+    // Parse URL từ stderr — cloudflared in "https://xxxx.trycloudflare.com"
     let mut lines = BufReader::new(stderr).lines();
 
     let url = tokio::time::timeout(
@@ -98,15 +67,14 @@ pub async fn start_tunnel(config: &Config) -> Result<String> {
                     return Ok::<_, anyhow::Error>(u);
                 }
             }
-            anyhow::bail!("cloudflared exited without URL")
+            anyhow::bail!("cloudflared thoát mà không in URL")
         },
     )
     .await
-    .context("Timeout")??;
+    .context("Timeout 30s — cloudflared không phản hồi")??;
 
-    tokio::spawn(async move {
-        let _ = child.wait().await;
-    });
+    // Keep alive
+    tokio::spawn(async move { let _ = child.wait().await; });
     tokio::spawn(async move {
         while let Ok(Some(_)) = lines.next_line().await {}
     });
@@ -115,13 +83,15 @@ pub async fn start_tunnel(config: &Config) -> Result<String> {
 }
 
 fn extract_url(line: &str) -> Option<String> {
+    // Chỉ lấy URL dạng https://xxxx.trycloudflare.com
     if let Some(i) = line.find("https://") {
         let rest = &line[i..];
         let end = rest
-            .find(|c: char| c.is_whitespace() || c == '|' || c == '"')
+            .find(|c: char| c.is_whitespace() || c == '|' || c == '"' || c == ')')
             .unwrap_or(rest.len());
         let url = &rest[..end];
-        if url.contains('.') && url.len() > 12 {
+        // Chỉ accept trycloudflare.com — bỏ qua mọi URL khác
+        if url.ends_with(".trycloudflare.com") {
             return Some(url.to_string());
         }
     }

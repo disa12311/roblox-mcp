@@ -1,99 +1,129 @@
 mod bridge;
-mod mcp_server;
-mod tunnel;
 mod http_server;
+mod tunnel;
 
 use anyhow::Result;
-use tracing::info;
+use colored::Colorize;
 
-/// Cấu hình đọc từ CLI args hoặc env
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Port MCP HTTP server lắng nghe
-    pub mcp_port: u16,
-    /// Port Roblox Studio plugin gửi request vào
-    pub bridge_port: u16,
-    /// Subdomain Cloudflare của bạn (ví dụ: roblox-mcp.yourdomain.com)
-    pub cf_tunnel_token: Option<String>,
-    /// Nếu không có token, dùng quick tunnel (URL random)
+    pub mcp_port:         u16,
+    pub bridge_port:      u16,
+    pub cf_tunnel_token:  Option<String>,
     pub use_quick_tunnel: bool,
 }
 
 impl Config {
     pub fn from_env() -> Self {
         Self {
-            mcp_port: std::env::var("MCP_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(3000),
-            bridge_port: std::env::var("BRIDGE_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(7878),
-            cf_tunnel_token: std::env::var("CF_TUNNEL_TOKEN").ok(),
+            mcp_port:         std::env::var("MCP_PORT").ok()
+                                .and_then(|p| p.parse().ok()).unwrap_or(3000),
+            bridge_port:      std::env::var("BRIDGE_PORT").ok()
+                                .and_then(|p| p.parse().ok()).unwrap_or(7878),
+            cf_tunnel_token:  std::env::var("CF_TUNNEL_TOKEN").ok(),
             use_quick_tunnel: std::env::var("QUICK_TUNNEL")
-                .map(|v| v == "1" || v == "true")
-                .unwrap_or(false),
+                                .map(|v| v == "1" || v == "true").unwrap_or(true),
         }
     }
 }
 
+fn print_banner() {
+    println!();
+    println!("{}", "╔══════════════════════════════════════════╗".cyan());
+    println!("{}", "║     Roblox Studio MCP Server v0.1        ║".cyan());
+    println!("{}", "╚══════════════════════════════════════════╝".cyan());
+    println!();
+}
+
+fn print_status(label: &str, value: &str, ok: bool) {
+    let icon = if ok { "✓".green().bold() } else { "✗".red().bold() };
+    println!("  {}  {:<10}  {}", icon, label.white(), value.bright_white());
+}
+
+fn print_ready(url: &str, bridge_port: u16) {
+    println!();
+    println!("{}", "┌──────────────────────────────────────────┐".bright_green());
+    println!("{}", "│              ✅  READY                    │".bright_green());
+    println!("{}", "├──────────────────────────────────────────┤".bright_green());
+    println!("{}  {:<28}{}",
+        "│  Public URL:".bright_green(),
+        url.bright_white(),
+        "│".bright_green()
+    );
+    println!("{}  {:<28}{}",
+        "│  Bridge:    ".bright_green(),
+        format!("localhost:{bridge_port}").bright_white(),
+        "│".bright_green()
+    );
+    println!("{}", "├──────────────────────────────────────────┤".bright_green());
+    println!("{}", "│  Thêm vào claude.ai:                     │".bright_green());
+    println!("{}", "│  Settings → Connectors → Add custom      │".bright_green());
+    println!("{}", "└──────────────────────────────────────────┘".bright_green());
+    println!();
+    println!("  {} Ctrl+C để dừng\n", "→".yellow());
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Log ra stderr (stdout dành riêng cho MCP stdio nếu cần)
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("roblox_mcp=info".parse()?)
-                .add_directive("tower_http=debug".parse()?),
+                .add_directive("tower_http=warn".parse()?),
         )
-        .with_ansi(true)
+        .with_ansi(false)
         .init();
+
+    print_banner();
 
     let config = Config::from_env();
 
-    info!("=== Roblox Studio MCP Server ===");
-    info!("MCP HTTP port  : {}", config.mcp_port);
-    info!("Studio bridge  : {}", config.bridge_port);
+    print_status("MCP port",  &format!("localhost:{}", config.mcp_port),    true);
+    print_status("Bridge",    &format!("localhost:{}", config.bridge_port), true);
 
-    // Shared state giữa bridge và MCP server
-    let bridge_state = bridge::BridgeState::new();
+    if config.cf_tunnel_token.is_some() {
+        print_status("Tunnel", "Named (URL cố định)", true);
+    } else {
+        print_status("Tunnel", "Quick (URL random — thay đổi mỗi lần restart)", true);
+    }
 
-    // Task 1: HTTP server nhận lệnh từ Roblox Studio plugin
-    let bridge_state_clone = bridge_state.clone();
-    let bridge_port = config.bridge_port;
+    println!("\n  {} Đang khởi động...", "⟳".yellow());
+
+    let bridge = bridge::BridgeState::new();
+
+    // Bridge server — nhận long-poll từ Studio plugin
+    let b = bridge.clone();
+    let port = config.bridge_port;
     tokio::spawn(async move {
-        if let Err(e) = bridge::run_bridge_server(bridge_state_clone, bridge_port).await {
-            tracing::error!("Bridge server error: {e}");
+        if let Err(e) = bridge::run_bridge_server(b, port).await {
+            eprintln!("Bridge error: {e}");
         }
     });
 
-    // Task 2: MCP HTTP server (Streamable HTTP — Claude web dùng)
-    let bridge_state_clone = bridge_state.clone();
-    let mcp_port = config.mcp_port;
+    // MCP HTTP server — Claude web kết nối vào đây
+    let b = bridge.clone();
+    let port = config.mcp_port;
     tokio::spawn(async move {
-        if let Err(e) = http_server::run_mcp_http_server(bridge_state_clone, mcp_port).await {
-            tracing::error!("MCP HTTP server error: {e}");
+        if let Err(e) = http_server::run_mcp_http_server(b, port).await {
+            eprintln!("MCP HTTP error: {e}");
         }
     });
 
-    // Task 3: Cloudflare tunnel
-    let public_url = tunnel::start_tunnel(&config).await?;
-    info!("");
-    info!("╔══════════════════════════════════════════════════╗");
-    info!("║         ROBLOX STUDIO MCP — READY                ║");
-    info!("╠══════════════════════════════════════════════════╣");
-    info!("║  Public URL: {:<36} ║", public_url);
-    info!("╠══════════════════════════════════════════════════╣");
-    info!("║  Thêm vào claude.ai:                             ║");
-    info!("║  Settings → Connectors → Add custom connector   ║");
-    info!("╚══════════════════════════════════════════════════╝");
-    info!("");
-    info!("Chờ Roblox Studio plugin kết nối trên port {}...", config.bridge_port);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    // Giữ process chạy
+    // Cloudflare tunnel
+    match tunnel::start_tunnel(&config).await {
+        Ok(url) => print_ready(&url, config.bridge_port),
+        Err(e) => {
+            println!("\n  {} Tunnel lỗi: {}", "✗".red().bold(), e.to_string().red());
+            std::process::exit(1);
+        }
+    }
+
+    println!("  {} Chờ Roblox Studio plugin kết nối...\n", "◉".bright_blue());
+
     tokio::signal::ctrl_c().await?;
-    info!("Shutting down...");
+    println!("\n  {} Đã dừng.", "✓".green());
     Ok(())
 }
