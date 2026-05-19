@@ -1,14 +1,11 @@
 /// http_server.rs — MCP Streamable HTTP (spec 2025-03-26)
 ///
-/// Flow Claude dùng khi connect:
-/// 1. POST / với body {"method":"initialize",...}
-///    → Server trả 200 + InitializeResult + Mcp-Session-Id header
-/// 2. POST / với body {"method":"notifications/initialized",...}
-///    → Server trả 202 Accepted (no body)
-/// 3. POST / với body {"method":"tools/list",...}
-///    → Server trả danh sách tools
-/// 4. POST / với body {"method":"tools/call",...}
-///    → Server chạy tool và trả kết quả
+/// Cải tiến so với v0.1:
+/// - Fix `insert_script`: escape source qua JSON encode thay vì nhúng trực tiếp
+///   vào long-bracket string (tránh lỗi nếu source chứa `]=]`)
+/// - Thêm `get_scripts` vào `tools_schema()` (bị thiếu trong v0.1)
+/// - `dispatch()` trả lỗi rõ hơn khi plugin offline
+/// - `handle_post()` log method + session ở level debug thay vì mặc định
 
 use crate::bridge::{BridgeState, CommandKind};
 use anyhow::Result;
@@ -21,13 +18,15 @@ use axum::{
     routing::any,
 };
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+use tracing::{debug, info};
 use uuid::Uuid;
 
 #[derive(Clone)]
 struct AppState {
     bridge: BridgeState,
 }
+
+// ── Main handler ──────────────────────────────────────────────────
 
 async fn mcp_handler(
     method: Method,
@@ -37,24 +36,23 @@ async fn mcp_handler(
 ) -> impl IntoResponse {
     match method {
         Method::POST    => handle_post(s, headers, body).await.into_response(),
-        Method::GET     => handle_get().await.into_response(),
-        Method::HEAD    => handle_head().await.into_response(),
-        Method::OPTIONS => handle_options().await.into_response(),
+        Method::GET     => handle_get().into_response(),
+        Method::HEAD    => handle_head().into_response(),
+        Method::OPTIONS => handle_options().into_response(),
         _               => StatusCode::METHOD_NOT_ALLOWED.into_response(),
     }
 }
 
 // HEAD / — protocol discovery
-async fn handle_head() -> impl IntoResponse {
+fn handle_head() -> impl IntoResponse {
     let mut h = HeaderMap::new();
     h.insert("MCP-Protocol-Version", HeaderValue::from_static("2025-03-26"));
     h.insert(header::CONTENT_TYPE,   HeaderValue::from_static("application/json"));
     (StatusCode::OK, h)
 }
 
-// GET / — trả 405 để Claude biết đây là POST-only Streamable HTTP server
-// (không phải SSE server — SSE server dùng GET để stream)
-async fn handle_get() -> impl IntoResponse {
+// GET / — báo đây là POST-only Streamable HTTP (không phải SSE)
+fn handle_get() -> impl IntoResponse {
     let mut h = HeaderMap::new();
     h.insert(header::ALLOW,          HeaderValue::from_static("POST, HEAD, OPTIONS"));
     h.insert("MCP-Protocol-Version", HeaderValue::from_static("2025-03-26"));
@@ -62,27 +60,26 @@ async fn handle_get() -> impl IntoResponse {
 }
 
 // OPTIONS / — CORS preflight
-async fn handle_options() -> impl IntoResponse {
+fn handle_options() -> impl IntoResponse {
     let mut h = HeaderMap::new();
-    h.insert(header::ALLOW,                        HeaderValue::from_static("POST, HEAD, OPTIONS"));
-    h.insert("Access-Control-Allow-Origin",        HeaderValue::from_static("*"));
-    h.insert("Access-Control-Allow-Methods",       HeaderValue::from_static("POST, HEAD, OPTIONS"));
-    h.insert("Access-Control-Allow-Headers",       HeaderValue::from_static("Content-Type, Mcp-Session-Id, Accept"));
-    h.insert("MCP-Protocol-Version",               HeaderValue::from_static("2025-03-26"));
+    h.insert(header::ALLOW,                  HeaderValue::from_static("POST, HEAD, OPTIONS"));
+    h.insert("Access-Control-Allow-Origin",  HeaderValue::from_static("*"));
+    h.insert("Access-Control-Allow-Methods", HeaderValue::from_static("POST, HEAD, OPTIONS"));
+    h.insert("Access-Control-Allow-Headers", HeaderValue::from_static("Content-Type, Mcp-Session-Id, Accept"));
+    h.insert("MCP-Protocol-Version",         HeaderValue::from_static("2025-03-26"));
     (StatusCode::NO_CONTENT, h)
 }
 
-// POST / — endpoint chính xử lý tất cả JSON-RPC
+// POST / — endpoint chính, xử lý toàn bộ JSON-RPC
 async fn handle_post(
     s: AppState,
     req_headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    // Parse JSON-RPC
     let req: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
-            return make_response(StatusCode::BAD_REQUEST, None, serde_json::json!({
+            return make_json_response(StatusCode::BAD_REQUEST, None, serde_json::json!({
                 "jsonrpc": "2.0", "id": null,
                 "error": { "code": -32700, "message": format!("Parse error: {e}") }
             })).into_response();
@@ -92,33 +89,26 @@ async fn handle_post(
     let method = req["method"].as_str().unwrap_or("");
     let id     = req["id"].clone();
 
-    // Notifications — trả 202 Accepted, không cần body
+    // Notifications — 202 Accepted, không body
     if method.starts_with("notifications/") {
         let mut h = HeaderMap::new();
         h.insert("MCP-Protocol-Version", HeaderValue::from_static("2025-03-26"));
         return (StatusCode::ACCEPTED, h).into_response();
     }
 
-    // Session ID từ request header hoặc tạo mới khi initialize
     let session_id = req_headers
         .get("Mcp-Session-Id")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    tracing::debug!("MCP [{session_id}] → {method}");
+    debug!("MCP [{session_id}] → {method}");
 
     let result = match method {
         "initialize" => {
-            // Trả đúng protocolVersion mà client gửi lên (hoặc version mình support)
-            let client_version = req["params"]["protocolVersion"]
-                .as_str()
-                .unwrap_or("2025-03-26");
-            let proto = if client_version >= "2025-03-26" {
-                "2025-03-26"
-            } else {
-                "2024-11-05"
-            };
+            let proto = negotiate_protocol(
+                req["params"]["protocolVersion"].as_str().unwrap_or("2025-03-26")
+            );
             serde_json::json!({
                 "protocolVersion": proto,
                 "capabilities": {
@@ -126,13 +116,14 @@ async fn handle_post(
                 },
                 "serverInfo": {
                     "name": "roblox-studio-mcp",
-                    "version": "0.1.0"
+                    "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "\
-                    QUAN TRỌNG: \
-                    1. Gọi snapshot() ĐẦU TIÊN để lấy toàn bộ context game. \
-                    2. Dùng batch_run([...]) thay vì nhiều run_code() riêng lẻ. \
-                    3. Gộp nhiều thay đổi vào 1 đoạn code khi có thể."
+                "instructions": concat!(
+                    "QUAN TRỌNG: ",
+                    "1. Gọi snapshot() ĐẦU TIÊN để lấy toàn bộ context game. ",
+                    "2. Dùng batch_run([...]) thay vì nhiều run_code() riêng lẻ. ",
+                    "3. Gộp nhiều thay đổi vào 1 đoạn code khi có thể."
+                )
             })
         }
 
@@ -143,7 +134,7 @@ async fn handle_post(
         "tools/call" => {
             let name = req["params"]["name"].as_str().unwrap_or("");
             let args = req["params"]["arguments"].clone();
-            let out  = dispatch(s.bridge, name, args).await;
+            let out  = dispatch(&s.bridge, name, &args).await;
             serde_json::json!({
                 "content": [{ "type": "text", "text": out }],
                 "isError": false
@@ -153,40 +144,38 @@ async fn handle_post(
         "ping" => serde_json::json!({}),
 
         _ => {
-            return make_response(
+            return make_json_response(
                 StatusCode::OK,
                 Some(&session_id),
                 serde_json::json!({
                     "jsonrpc": "2.0", "id": id,
-                    "error": {
-                        "code": -32601,
-                        "message": format!("Method not found: {method}")
-                    }
+                    "error": { "code": -32601, "message": format!("Method not found: {method}") }
                 }),
             ).into_response();
         }
     };
 
-    make_response(
+    make_json_response(
         StatusCode::OK,
         Some(&session_id),
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": result
-        }),
+        serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }),
     )
     .into_response()
 }
 
-fn make_response(
+/// Chọn protocol version phù hợp nhất với client.
+fn negotiate_protocol(client_version: &str) -> &'static str {
+    if client_version >= "2025-03-26" { "2025-03-26" } else { "2024-11-05" }
+}
+
+fn make_json_response(
     status: StatusCode,
     session_id: Option<&str>,
     body: serde_json::Value,
 ) -> impl IntoResponse {
     let mut h = HeaderMap::new();
-    h.insert(header::CONTENT_TYPE,   HeaderValue::from_static("application/json"));
-    h.insert("MCP-Protocol-Version", HeaderValue::from_static("2025-03-26"));
+    h.insert(header::CONTENT_TYPE,          HeaderValue::from_static("application/json"));
+    h.insert("MCP-Protocol-Version",        HeaderValue::from_static("2025-03-26"));
     h.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
     if let Some(sid) = session_id {
         if let Ok(v) = HeaderValue::from_str(sid) {
@@ -198,43 +187,67 @@ fn make_response(
 
 // ── Tool dispatch ─────────────────────────────────────────────────
 
-async fn dispatch(bridge: BridgeState, name: &str, args: serde_json::Value) -> String {
+async fn dispatch(bridge: &BridgeState, name: &str, args: &serde_json::Value) -> String {
+    // Kiểm tra plugin có online không trước khi gửi lệnh nặng
+    if !bridge.is_plugin_online() && !matches!(name, "status") {
+        return "❌ Plugin chưa kết nối. Mở Roblox Studio và click Connect trong widget Claude MCP.".to_string();
+    }
+
     let cmd = match name {
-        "snapshot"      => CommandKind::Snapshot {},
-        "get_scripts"   => CommandKind::GetScripts {},
-        "status"        => CommandKind::RunCode {
+        "snapshot"    => CommandKind::Snapshot {},
+        "get_scripts" => CommandKind::GetScripts {},
+
+        "status" => CommandKind::RunCode {
             code: r#"print("✅ "..tostring(version()))"#.to_string(),
         },
-        "run_code"      => CommandKind::RunCode {
+
+        "run_code" => CommandKind::RunCode {
             code: args["code"].as_str().unwrap_or("").to_string(),
         },
+
         "get_instances" => CommandKind::GetInstances {
             path: args["path"].as_str().unwrap_or("game").to_string(),
         },
-        "insert_part"   => CommandKind::InsertPart {
+
+        "insert_part" => CommandKind::InsertPart {
             name:   args["name"].as_str().unwrap_or("Part").to_string(),
             parent: args["parent"].as_str().unwrap_or("game.Workspace").to_string(),
         },
+
+        // FIX: encode source thành JSON string để tránh lỗi khi source chứa ]=]
+        // Thay vì nhúng source trực tiếp vào long-bracket [=[...]=]
         "insert_script" => {
-            let n   = args["name"].as_str().unwrap_or("Script");
-            let t   = args["script_type"].as_str().unwrap_or("Script");
-            let p   = args["parent"].as_str().unwrap_or("game.ServerScriptService");
-            let src = args["source"].as_str().unwrap_or("");
+            let script_name = args["name"].as_str().unwrap_or("Script");
+            let script_type = args["script_type"].as_str().unwrap_or("Script");
+            let parent      = args["parent"].as_str().unwrap_or("game.ServerScriptService");
+            let source      = args["source"].as_str().unwrap_or("");
+            // Encode source thành JSON string literal an toàn
+            let source_json = serde_json::to_string(source).unwrap_or_else(|_| "\"\"".to_string());
             CommandKind::RunCode {
                 code: format!(
-                    "local s=Instance.new(\"{t}\")\ns.Name=\"{n}\"\ns.Source=[=[{src}]=]\ns.Parent={p}\nprint(\"✅ \"..s.Name)"
+                    "local s = Instance.new({script_type_json})\n\
+                     s.Name   = {name_json}\n\
+                     s.Source = {source_json}\n\
+                     s.Parent = {parent}\n\
+                     print(\"✅ \" .. s.Name)",
+                    script_type_json = serde_json::to_string(script_type).unwrap(),
+                    name_json        = serde_json::to_string(script_name).unwrap(),
+                    source_json      = source_json,
+                    parent           = parent,
                 ),
             }
         }
+
         "batch_run" => {
             let codes = args["codes"]
                 .as_array()
                 .map(|a| a.iter()
                     .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect())
+                    .collect::<Vec<_>>())
                 .unwrap_or_default();
             CommandKind::BatchRun { codes }
         }
+
         _ => return format!("❌ Unknown tool: {name}"),
     };
 
@@ -247,19 +260,19 @@ fn tools_schema() -> serde_json::Value {
     serde_json::json!([
         {
             "name": "snapshot",
-            "description": "Lấy toàn bộ context game 1 lần: instances, scripts, version. Gọi đầu tiên.",
+            "description": "Lấy toàn bộ context game 1 lần: instances, scripts kèm source, version. GỌI ĐẦU TIÊN trước mọi thao tác.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "batch_run",
-            "description": "Chạy nhiều đoạn Luau tuần tự trong 1 lần gọi. Tiết kiệm token hơn run_code nhiều lần.",
+            "description": "Chạy nhiều đoạn Luau tuần tự trong 1 lần gọi. Tiết kiệm token hơn nhiều lần run_code.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "codes": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Danh sách code chạy theo thứ tự"
+                        "description": "Danh sách đoạn Luau chạy theo thứ tự"
                     }
                 },
                 "required": ["codes"]
@@ -267,16 +280,18 @@ fn tools_schema() -> serde_json::Value {
         },
         {
             "name": "run_code",
-            "description": "Chạy 1 đoạn Luau. Dùng batch_run nếu cần nhiều thao tác.",
+            "description": "Chạy 1 đoạn Luau và trả output. Dùng batch_run khi cần nhiều thao tác.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "code": { "type": "string" } },
+                "properties": {
+                    "code": { "type": "string", "description": "Luau code cần chạy" }
+                },
                 "required": ["code"]
             }
         },
         {
             "name": "get_instances",
-            "description": "Xem children của 1 path. Dùng snapshot() nếu cần tổng thể.",
+            "description": "Xem children của 1 path cụ thể. Dùng snapshot() nếu cần tổng quan toàn game.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -286,13 +301,18 @@ fn tools_schema() -> serde_json::Value {
             }
         },
         {
+            "name": "get_scripts",
+            "description": "Đọc tất cả scripts kèm toàn bộ source code. Dùng để review hoặc debug code.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
             "name": "insert_part",
-            "description": "Tạo Part mới.",
+            "description": "Tạo Part mới trong game.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name":   { "type": "string" },
-                    "parent": { "type": "string" }
+                    "name":   { "type": "string", "description": "Tên Part" },
+                    "parent": { "type": "string", "description": "Path parent, ví dụ: game.Workspace" }
                 },
                 "required": ["name", "parent"]
             }
@@ -303,17 +323,21 @@ fn tools_schema() -> serde_json::Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name":        { "type": "string" },
-                    "script_type": { "type": "string", "enum": ["Script","LocalScript","ModuleScript"] },
-                    "parent":      { "type": "string" },
-                    "source":      { "type": "string" }
+                    "name":        { "type": "string", "description": "Tên script" },
+                    "script_type": {
+                        "type": "string",
+                        "enum": ["Script", "LocalScript", "ModuleScript"],
+                        "description": "Loại script"
+                    },
+                    "parent": { "type": "string", "description": "Path parent" },
+                    "source": { "type": "string", "description": "Source code Luau" }
                 },
-                "required": ["name","script_type","parent","source"]
+                "required": ["name", "script_type", "parent", "source"]
             }
         },
         {
             "name": "status",
-            "description": "Kiểm tra kết nối với Roblox Studio plugin.",
+            "description": "Kiểm tra kết nối với Roblox Studio plugin và lấy version.",
             "inputSchema": { "type": "object", "properties": {} }
         }
     ])

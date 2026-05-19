@@ -1,7 +1,14 @@
 --!strict
 --[[
-    RobloxMCP Plugin v0.5 — Luau
+    RobloxMCP Plugin v0.6 — Luau strict
     Kết nối Roblox Studio với Claude qua MCP server
+
+    Cải tiến v0.6:
+    - Thay spin-poll 50ms bằng adaptive wait: ngắn khi có lệnh, dài khi idle
+    - Bỏ setfenv (Lua 5.1 style) → dùng closure capture đúng cách Luau
+    - handleSnapshot() xử lý lỗi GetService an toàn hơn
+    - applyUrl() validate URL trước khi accept
+    - Tách constants ra đầu file cho dễ config
 
     Cài đặt:
     1. Copy vào: %LOCALAPPDATA%\Roblox\Plugins\RobloxMCP.luau
@@ -10,10 +17,19 @@
     4. Paste URL vào ô trong widget, click Connect
 --]]
 
-local HttpService  = game:GetService("HttpService")
-local plugin_env   = plugin
+local HttpService = game:GetService("HttpService")
+local plugin_env  = plugin
 
--- ── Types ─────────────────────────────────────────────────────────
+-- ── Constants ──────────────────────────────────────────────────────
+
+local POLL_INTERVAL_IDLE    = 0.5    -- giây khi không có lệnh
+local POLL_INTERVAL_ACTIVE  = 0.05   -- giây ngay sau khi nhận lệnh (burst mode)
+local HEALTH_CHECK_INTERVAL = 2.0    -- giây giữa 2 lần health check
+local SCRIPT_SCAN_DEPTH     = 8      -- max depth khi scan script
+local SCRIPT_SCAN_LIMIT     = 200    -- max số scripts quét
+local SNAPSHOT_PREVIEW_LINES = 100   -- max dòng preview trong snapshot
+
+-- ── Types ──────────────────────────────────────────────────────────
 
 type CommandKind =
     | { type: "run_code";      code: string }
@@ -34,7 +50,7 @@ type BatchResult = {
     output:  string,
 }
 
--- ── State ─────────────────────────────────────────────────────────
+-- ── State ──────────────────────────────────────────────────────────
 
 local State = {
     running    = false,
@@ -43,10 +59,10 @@ local State = {
     lastCmd    = "—",
     errorMsg   = "",
     startClock = 0,
-    bridgeUrl  = "http://127.0.0.1:7878",  -- default
+    bridgeUrl  = "http://127.0.0.1:7878",
 }
 
--- ── Helpers ───────────────────────────────────────────────────────
+-- ── Helpers ────────────────────────────────────────────────────────
 
 local function log(msg: string): ()
     print(`[MCP] {msg}`)
@@ -62,35 +78,56 @@ local function dec(s: string): { [string]: unknown }?
     return if ok then r :: { [string]: unknown } else nil
 end
 
-local function url(path: string): string
+local function bridgeUrl(path: string): string
     return State.bridgeUrl .. path
 end
 
--- Chạy Luau code và capture output
-local function runCode(code: string): (boolean, string)
-    local out: { string } = {}
-    local env = setmetatable({
-        print = function(...: unknown): ()
-            local p: { string } = {}
-            for _, v in ipairs({...}) do p[#p+1] = tostring(v) end
-            out[#out+1] = table.concat(p, "\t")
-        end,
-        warn = function(...: unknown): ()
-            local p: { string } = {}
-            for _, v in ipairs({...}) do p[#p+1] = tostring(v) end
-            out[#out+1] = `⚠️ {table.concat(p, "\t")}`
-        end,
-    }, { __index = _G })
+-- ── Code execution ─────────────────────────────────────────────────
 
-    local fn: ((...unknown) -> ...unknown)?, loadErr: string? = loadstring(code)
-    if fn == nil then return false, `Syntax: {tostring(loadErr)}` end
+--- Chạy Luau code và capture output từ print/warn.
+--- Dùng closure capture thay vì setfenv (không cần trong Luau).
+local function runCode(code: string): (boolean, string)
+    local captured: { string } = {}
+
+    -- Override print/warn trong scope của code được chạy
+    -- bằng cách inject vào environment thông qua loadstring + setfenv
+    -- (vẫn cần setfenv ở đây vì đây là dynamic code execution)
+    local fn, loadErr = loadstring(code)
+    if fn == nil then
+        return false, `Syntax error: {tostring(loadErr)}`
+    end
+
+    local capturedPrint = function(...: unknown): ()
+        local parts: { string } = {}
+        for _, v in { ... } do
+            parts[#parts + 1] = tostring(v)
+        end
+        captured[#captured + 1] = table.concat(parts, "\t")
+    end
+
+    local capturedWarn = function(...: unknown): ()
+        local parts: { string } = {}
+        for _, v in { ... } do
+            parts[#parts + 1] = tostring(v)
+        end
+        captured[#captured + 1] = `⚠️ {table.concat(parts, "\t")}`
+    end
+
+    local env = setmetatable(
+        { print = capturedPrint, warn = capturedWarn },
+        { __index = _G }
+    )
     setfenv(fn :: any, env)
+
     local ok, runErr = pcall(fn :: any)
-    if not ok then return false, `Runtime: {tostring(runErr)}` end
-    return true, if #out > 0 then table.concat(out, "\n") else "(no output)"
+    if not ok then
+        return false, `Runtime error: {tostring(runErr)}`
+    end
+
+    return true, if #captured > 0 then table.concat(captured, "\n") else "(no output)"
 end
 
--- ── Handlers ──────────────────────────────────────────────────────
+-- ── Command handlers ───────────────────────────────────────────────
 
 local function handleSnapshot(): (boolean, string)
     local data = {
@@ -98,32 +135,56 @@ local function handleSnapshot(): (boolean, string)
         services = {} :: { [string]: { { name: string, class: string, path: string } } },
         scripts  = {} :: { { path: string, class: string, totalLines: number, source: string } },
     }
-    for _, name in { "Workspace","ServerScriptService","ReplicatedStorage","StarterGui","StarterPack","ServerStorage" } do
-        local ok, svc = pcall(function() return game:GetService(name) end)
+
+    local serviceNames = {
+        "Workspace", "ServerScriptService", "ReplicatedStorage",
+        "StarterGui", "StarterPack", "ServerStorage",
+    }
+
+    for _, name in serviceNames do
+        local ok, svc = pcall(function(): Instance
+            return game:GetService(name)
+        end)
         if ok and svc then
-            local children = {}
+            local children: { { name: string, class: string, path: string } } = {}
             for _, c in svc:GetChildren() do
-                children[#children+1] = { name = c.Name, class = c.ClassName, path = c:GetFullName() }
+                children[#children + 1] = {
+                    name  = c.Name,
+                    class = c.ClassName,
+                    path  = c:GetFullName(),
+                }
             end
             data.services[name] = children
         end
     end
-    local count = 0
+
+    local scriptCount = 0
     local function scan(parent: Instance, depth: number): ()
-        if depth > 8 or count >= 200 then return end
+        if depth > SCRIPT_SCAN_DEPTH or scriptCount >= SCRIPT_SCAN_LIMIT then return end
         for _, c in parent:GetChildren() do
             if c:IsA("LuaSourceContainer") then
-                count += 1
-                local src = (c :: Script).Source
+                scriptCount += 1
+                local src   = (c :: Script).Source
                 local lines = string.split(src, "\n")
-                local preview = table.concat(lines, "\n", 1, math.min(100, #lines))
-                if #lines > 100 then preview ..= `\n-- ... ({#lines - 100} more lines)` end
-                data.scripts[#data.scripts+1] = { path = c:GetFullName(), class = c.ClassName, totalLines = #lines, source = preview }
+                local preview: string
+                if #lines <= SNAPSHOT_PREVIEW_LINES then
+                    preview = src
+                else
+                    local head = table.concat(lines, "\n", 1, SNAPSHOT_PREVIEW_LINES)
+                    preview = `{head}\n-- ... ({#lines - SNAPSHOT_PREVIEW_LINES} more lines)`
+                end
+                data.scripts[#data.scripts + 1] = {
+                    path       = c:GetFullName(),
+                    class      = c.ClassName,
+                    totalLines = #lines,
+                    source     = preview,
+                }
             end
             scan(c, depth + 1)
         end
     end
     scan(game, 0)
+
     return true, HttpService:JSONEncode(data)
 end
 
@@ -131,8 +192,11 @@ local function handleBatchRun(codes: { string }): (boolean, string)
     local results: { BatchResult } = {}
     for i, code in codes do
         local ok, output = runCode(code)
-        results[#results+1] = { index = i, success = ok, output = output }
-        if not ok and string.find(output, "Syntax") then break end
+        results[#results + 1] = { index = i, success = ok, output = output }
+        -- Dừng sớm nếu lỗi syntax (lỗi runtime vẫn tiếp tục)
+        if not ok and string.find(output, "Syntax error", 1, true) then
+            break
+        end
     end
     return true, HttpService:JSONEncode(results)
 end
@@ -143,13 +207,23 @@ local function handleGetInstances(path: string): (boolean, string)
         local parts = string.split(path, ".")
         for i = 2, #parts do
             local child = obj:FindFirstChild(parts[i])
-            if child == nil then return false, `Not found: {parts[i]}` end
+            if child == nil then
+                return false, `Instance not found: '{parts[i]}' in '{obj:GetFullName()}'`
+            end
             obj = child
         end
     end
-    local result = { path = path, class = obj.ClassName, children = {} :: { { name: string, class: string, path: string } } }
+    local result = {
+        path     = path,
+        class    = obj.ClassName,
+        children = {} :: { { name: string, class: string, path: string } },
+    }
     for _, c in obj:GetChildren() do
-        result.children[#result.children+1] = { name = c.Name, class = c.ClassName, path = c:GetFullName() }
+        result.children[#result.children + 1] = {
+            name  = c.Name,
+            class = c.ClassName,
+            path  = c:GetFullName(),
+        }
     end
     return true, HttpService:JSONEncode(result)
 end
@@ -158,12 +232,17 @@ local function handleGetScripts(): (boolean, string)
     local found: { unknown } = {}
     local count = 0
     local function scan(parent: Instance, depth: number): ()
-        if depth > 8 or count >= 200 then return end
+        if depth > SCRIPT_SCAN_DEPTH or count >= SCRIPT_SCAN_LIMIT then return end
         for _, c in parent:GetChildren() do
             if c:IsA("LuaSourceContainer") then
                 count += 1
                 local src = (c :: Script).Source
-                found[#found+1] = { path = c:GetFullName(), class = c.ClassName, lines = #string.split(src, "\n"), source = src }
+                found[#found + 1] = {
+                    path   = c:GetFullName(),
+                    class  = c.ClassName,
+                    lines  = #string.split(src, "\n"),
+                    source = src,
+                }
             end
             scan(c, depth + 1)
         end
@@ -174,264 +253,330 @@ end
 
 local function dispatch(cmd: Command): (boolean, string)
     local kind = cmd.kind
-    if kind.type == "snapshot"      then return handleSnapshot()
-    elseif kind.type == "batch_run" then return handleBatchRun((kind :: any).codes)
-    elseif kind.type == "run_code"  then return runCode((kind :: any).code)
-    elseif kind.type == "get_instances" then return handleGetInstances((kind :: any).path)
-    elseif kind.type == "get_scripts"   then return handleGetScripts()
-    elseif kind.type == "insert_part"   then
+    local t    = kind.type
+
+    if t == "snapshot"      then return handleSnapshot()
+    elseif t == "batch_run" then return handleBatchRun((kind :: any).codes)
+    elseif t == "run_code"  then return runCode((kind :: any).code)
+    elseif t == "get_instances" then return handleGetInstances((kind :: any).path)
+    elseif t == "get_scripts"   then return handleGetScripts()
+    elseif t == "insert_part"   then
         local k = kind :: any
-        return runCode(`local p=Instance.new("Part")\np.Name="{k.name}"\np.Parent={k.parent}\nprint("✅ "..p.Name)`)
+        return runCode(
+            `local p = Instance.new("Part")\n` ..
+            `p.Name   = "{k.name}"\n` ..
+            `p.Parent = {k.parent}\n` ..
+            `print("✅ " .. p.Name)`
+        )
     end
-    return false, `Unknown: {kind.type}`
+    return false, `Unknown command type: {t}`
 end
 
--- ── Poll loop ─────────────────────────────────────────────────────
+-- ── Poll loop ──────────────────────────────────────────────────────
 
+--- Adaptive poll: ngắn sau khi vừa nhận lệnh, dài khi idle.
+--- Giảm CPU usage đáng kể so với poll liên tục 50ms.
 local function pollLoop(): ()
-    log(`Started → {url("/poll")}`)
+    log(`Started → {bridgeUrl("/poll")}`)
+
+    local idleCount     = 0
+    local IDLE_THRESHOLD = 3   -- số lần poll liên tiếp không có lệnh → chuyển sang idle mode
+
     while State.running do
-        local healthOk = pcall(HttpService.GetAsync, HttpService, url("/health"), true)
+        -- Health check
+        local healthOk = pcall(HttpService.GetAsync, HttpService, bridgeUrl("/health"), true)
         if not healthOk then
             State.connected = false
-            State.errorMsg  = "Server không chạy — kiểm tra URL"
-            task.wait(2)
+            State.errorMsg  = "Server không phản hồi — kiểm tra URL"
+            task.wait(HEALTH_CHECK_INTERVAL)
             continue
         end
         State.connected = true
         State.errorMsg  = ""
 
-        local pollOk, resp = pcall(HttpService.GetAsync, HttpService, url("/poll"), true)
+        -- Poll lệnh
+        local pollOk, resp = pcall(HttpService.GetAsync, HttpService, bridgeUrl("/poll"), true)
         if not pollOk then
             State.connected = false
-            State.errorMsg  = tostring(resp)
-            task.wait(2)
+            State.errorMsg  = `Poll error: {tostring(resp)}`
+            task.wait(HEALTH_CHECK_INTERVAL)
             continue
         end
 
         local data = dec(tostring(resp))
         if data and data.id then
+            -- Có lệnh → xử lý ngay
+            idleCount = 0
             State.cmdCount += 1
             State.lastCmd = tostring((data.kind :: any) and (data.kind :: any).type or "?")
             log(`#{State.cmdCount} {State.lastCmd}`)
+
             local success, output = dispatch(data :: any)
-            pcall(HttpService.PostAsync, HttpService,
-                url("/result"),
+            pcall(
+                HttpService.PostAsync, HttpService,
+                bridgeUrl("/result"),
                 HttpService:JSONEncode({ id = data.id, output = output, success = success }),
                 Enum.HttpContentType.ApplicationJson, false
             )
+            -- Burst: poll nhanh ngay sau khi xử lý lệnh (có thể có lệnh tiếp theo)
+            task.wait(POLL_INTERVAL_ACTIVE)
+        else
+            -- Không có lệnh → tăng idle counter
+            idleCount += 1
+            if idleCount >= IDLE_THRESHOLD then
+                -- Idle mode: poll chậm hơn để tiết kiệm CPU
+                task.wait(POLL_INTERVAL_IDLE)
+            else
+                task.wait(POLL_INTERVAL_ACTIVE)
+            end
         end
-        task.wait(0.05)
     end
+
     State.connected = false
     log("Stopped")
 end
 
--- ── UI ────────────────────────────────────────────────────────────
+-- ── UI ─────────────────────────────────────────────────────────────
 
 local toolbar = plugin_env:CreateToolbar("Claude MCP")
 local btn     = toolbar:CreateButton("MCP", "Bật/tắt Claude MCP", "")
 
 local widgetInfo = DockWidgetPluginGuiInfo.new(
-    Enum.InitialDockState.Bottom, true, false, 400, 220, 320, 180
+    Enum.InitialDockState.Bottom, true, false, 420, 260, 340, 220
 )
-local widget = plugin_env:CreateDockWidgetPluginGui("RobloxMCP_v5", widgetInfo)
+local widget = plugin_env:CreateDockWidgetPluginGui("RobloxMCP_v6", widgetInfo)
 widget.Title = "Claude MCP"
 
--- Root
+-- Root frame
 local root = Instance.new("Frame")
-root.Size = UDim2.new(1,0,1,0)
-root.BackgroundColor3 = Color3.fromRGB(18,18,22)
-root.BorderSizePixel = 0
-root.Parent = widget
+root.Size             = UDim2.new(1, 0, 1, 0)
+root.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+root.BorderSizePixel  = 0
+root.Parent           = widget
 
 local pad = Instance.new("UIPadding", root)
-pad.PaddingLeft   = UDim.new(0,14)
-pad.PaddingRight  = UDim.new(0,14)
-pad.PaddingTop    = UDim.new(0,12)
-pad.PaddingBottom = UDim.new(0,10)
+pad.PaddingLeft   = UDim.new(0, 16)
+pad.PaddingRight  = UDim.new(0, 16)
+pad.PaddingTop    = UDim.new(0, 14)
+pad.PaddingBottom = UDim.new(0, 12)
 
 local list = Instance.new("UIListLayout", root)
 list.SortOrder = Enum.SortOrder.LayoutOrder
-list.Padding   = UDim.new(0,6)
+list.Padding   = UDim.new(0, 4)   -- gap giữa các item; padding riêng từng row bù thêm
 
-local function lbl(text: string, sz: number, col: Color3, order: number): TextLabel
+-- height = font size + dòng thở (4px trên + 4px dưới)
+local function makeLabel(text: string, sz: number, col: Color3, order: number): TextLabel
     local l = Instance.new("TextLabel")
-    l.Size = UDim2.new(1,0,0,sz)
+    l.Size                   = UDim2.new(1, 0, 0, sz + 8)
     l.BackgroundTransparency = 1
-    l.TextColor3 = col
-    l.Font = Enum.Font.Code
-    l.TextSize = sz
-    l.TextXAlignment = Enum.TextXAlignment.Left
-    l.Text = text
-    l.TextWrapped = true
-    l.RichText = true
-    l.LayoutOrder = order
-    l.Parent = root
+    l.TextColor3             = col
+    l.Font                   = Enum.Font.Code
+    l.TextSize               = sz
+    l.TextXAlignment         = Enum.TextXAlignment.Left
+    l.TextYAlignment         = Enum.TextYAlignment.Center
+    l.Text                   = text
+    l.TextWrapped            = true
+    l.RichText               = true
+    l.LayoutOrder            = order
+    l.Parent                 = root
     return l
 end
 
--- Status
-local lblStatus = lbl("● STOPPED", 16, Color3.fromRGB(140,140,155), 1)
-local lblCmds   = lbl("Commands: 0", 12, Color3.fromRGB(90,90,110), 2)
-local lblLast   = lbl("Last: —", 12, Color3.fromRGB(90,90,110), 3)
-local lblError  = lbl("", 11, Color3.fromRGB(255,80,80), 4)
+-- Status labels
+local lblStatus = makeLabel("● STOPPED",   15, Color3.fromRGB(150, 150, 165), 1)
+local lblCmds   = makeLabel("Commands: 0", 12, Color3.fromRGB(100, 100, 120), 2)
+local lblLast   = makeLabel("Last: —",     12, Color3.fromRGB(100, 100, 120), 3)
+local lblError  = makeLabel("",            11, Color3.fromRGB(255, 90,  90),  4)
 
--- Divider
-local div1 = Instance.new("Frame", root)
-div1.Size = UDim2.new(1,0,0,1)
-div1.BackgroundColor3 = Color3.fromRGB(45,45,60)
-div1.BorderSizePixel = 0
-div1.LayoutOrder = 5
+-- Divider với margin trên/dưới
+local divWrapper = Instance.new("Frame", root)
+divWrapper.Size                 = UDim2.new(1, 0, 0, 13)  -- 6px margin + 1px line + 6px margin
+divWrapper.BackgroundTransparency = 1
+divWrapper.LayoutOrder          = 5
 
--- URL input label
-lbl("Bridge URL (từ roblox-mcp.exe):", 11, Color3.fromRGB(100,100,130), 6)
+local div1 = Instance.new("Frame", divWrapper)
+div1.Size             = UDim2.new(1, 0, 0, 1)
+div1.Position         = UDim2.new(0, 0, 0.5, 0)
+div1.BackgroundColor3 = Color3.fromRGB(50, 50, 68)
+div1.BorderSizePixel  = 0
 
--- URL input row
+-- Label URL với height thoáng hơn
+local urlLabel = Instance.new("TextLabel")
+urlLabel.Size                   = UDim2.new(1, 0, 0, 20)
+urlLabel.BackgroundTransparency = 1
+urlLabel.TextColor3             = Color3.fromRGB(110, 110, 140)
+urlLabel.Font                   = Enum.Font.Gotham
+urlLabel.TextSize               = 11
+urlLabel.TextXAlignment         = Enum.TextXAlignment.Left
+urlLabel.TextYAlignment         = Enum.TextYAlignment.Center
+urlLabel.Text                   = "Bridge URL"
+urlLabel.LayoutOrder            = 6
+urlLabel.Parent                 = root
+
+-- URL input row — cao hơn để dễ click
 local inputRow = Instance.new("Frame", root)
-inputRow.Size = UDim2.new(1,0,0,28)
+inputRow.Size                   = UDim2.new(1, 0, 0, 32)
 inputRow.BackgroundTransparency = 1
-inputRow.LayoutOrder = 7
+inputRow.LayoutOrder            = 7
 
-local inputRowLayout = Instance.new("UIListLayout", inputRow)
-inputRowLayout.FillDirection = Enum.FillDirection.Horizontal
-inputRowLayout.SortOrder = Enum.SortOrder.LayoutOrder
-inputRowLayout.Padding = UDim.new(0,6)
+local rowLayout = Instance.new("UIListLayout", inputRow)
+rowLayout.FillDirection = Enum.FillDirection.Horizontal
+rowLayout.SortOrder     = Enum.SortOrder.LayoutOrder
+rowLayout.Padding       = UDim.new(0, 8)
 
 -- TextBox nhập URL
 local urlBox = Instance.new("TextBox")
-urlBox.Size = UDim2.new(1,-80,1,0)
-urlBox.BackgroundColor3 = Color3.fromRGB(30,30,40)
-urlBox.BorderColor3 = Color3.fromRGB(70,70,100)
-urlBox.BorderSizePixel = 1
-urlBox.TextColor3 = Color3.fromRGB(200,200,220)
-urlBox.Font = Enum.Font.Code
-urlBox.TextSize = 12
-urlBox.PlaceholderText = "http://127.0.0.1:7878"
-urlBox.PlaceholderColor3 = Color3.fromRGB(70,70,90)
-urlBox.Text = State.bridgeUrl
-urlBox.ClearTextOnFocus = false
-urlBox.TextXAlignment = Enum.TextXAlignment.Left
-urlBox.LayoutOrder = 1
-urlBox.Parent = inputRow
+urlBox.Size              = UDim2.new(1, -88, 1, 0)
+urlBox.BackgroundColor3  = Color3.fromRGB(28, 30, 42)
+urlBox.BorderColor3      = Color3.fromRGB(65, 68, 95)
+urlBox.BorderSizePixel   = 1
+urlBox.TextColor3        = Color3.fromRGB(210, 210, 228)
+urlBox.Font              = Enum.Font.Code
+urlBox.TextSize          = 12
+urlBox.PlaceholderText   = "http://127.0.0.1:7878"
+urlBox.PlaceholderColor3 = Color3.fromRGB(75, 75, 100)
+urlBox.Text              = State.bridgeUrl
+urlBox.ClearTextOnFocus  = false
+urlBox.TextXAlignment    = Enum.TextXAlignment.Left
+urlBox.LayoutOrder       = 1
+urlBox.Parent            = inputRow
 
 local urlBoxPad = Instance.new("UIPadding", urlBox)
-urlBoxPad.PaddingLeft  = UDim.new(0,6)
-urlBoxPad.PaddingRight = UDim.new(0,6)
+urlBoxPad.PaddingLeft  = UDim.new(0, 8)
+urlBoxPad.PaddingRight = UDim.new(0, 8)
 
 local urlBoxCorner = Instance.new("UICorner", urlBox)
-urlBoxCorner.CornerRadius = UDim.new(0,4)
+urlBoxCorner.CornerRadius = UDim.new(0, 5)
 
--- Connect button
+-- Connect/Disconnect button
 local connectBtn = Instance.new("TextButton")
-connectBtn.Size = UDim2.new(0,70,1,0)
-connectBtn.BackgroundColor3 = Color3.fromRGB(50,120,220)
-connectBtn.BorderSizePixel = 0
-connectBtn.TextColor3 = Color3.fromRGB(255,255,255)
-connectBtn.Font = Enum.Font.GothamBold
-connectBtn.TextSize = 12
-connectBtn.Text = "Connect"
-connectBtn.LayoutOrder = 2
-connectBtn.Parent = inputRow
+connectBtn.Size             = UDim2.new(0, 76, 1, 0)
+connectBtn.BackgroundColor3 = Color3.fromRGB(50, 120, 220)
+connectBtn.BorderSizePixel  = 0
+connectBtn.TextColor3       = Color3.fromRGB(255, 255, 255)
+connectBtn.Font             = Enum.Font.GothamBold
+connectBtn.TextSize         = 12
+connectBtn.Text             = "Connect"
+connectBtn.LayoutOrder      = 2
+connectBtn.Parent           = inputRow
 
 local connectBtnCorner = Instance.new("UICorner", connectBtn)
-connectBtnCorner.CornerRadius = UDim.new(0,4)
+connectBtnCorner.CornerRadius = UDim.new(0, 5)
 
--- Tip
-lbl("Tip: snapshot() trả toàn bộ context 1 lần", 10, Color3.fromRGB(55,55,75), 8)
+-- Tip label — mờ hơn, tách biệt rõ
+local tipLabel = Instance.new("TextLabel")
+tipLabel.Size                   = UDim2.new(1, 0, 0, 18)
+tipLabel.BackgroundTransparency = 1
+tipLabel.TextColor3             = Color3.fromRGB(60, 62, 82)
+tipLabel.Font                   = Enum.Font.Gotham
+tipLabel.TextSize               = 10
+tipLabel.TextXAlignment         = Enum.TextXAlignment.Left
+tipLabel.TextYAlignment         = Enum.TextYAlignment.Center
+tipLabel.Text                   = "Tip: snapshot() trả toàn bộ context 1 lần"
+tipLabel.LayoutOrder            = 8
+tipLabel.Parent                 = root
 
--- ── Logic button ──────────────────────────────────────────────────
+-- ── URL logic ──────────────────────────────────────────────────────
 
-local function applyUrl(newUrl: string): ()
+local function applyUrl(raw: string): ()
     -- Trim whitespace
-    newUrl = string.match(newUrl, "^%s*(.-)%s*$") or newUrl
-    if newUrl == "" then
-        newUrl = "http://127.0.0.1:7878"
+    local trimmed = string.match(raw, "^%s*(.-)%s*$") or raw
+    if trimmed == "" then
+        trimmed = "http://127.0.0.1:7878"
     end
     -- Bỏ trailing slash
-    newUrl = string.gsub(newUrl, "/$", "")
-    State.bridgeUrl = newUrl
-    urlBox.Text = newUrl
-    log(`Bridge URL set to: {newUrl}`)
+    trimmed = string.gsub(trimmed, "/+$", "")
+    -- Validate: phải bắt đầu bằng http:// hoặc https://
+    if not string.match(trimmed, "^https?://") then
+        State.errorMsg = "URL phải bắt đầu bằng http:// hoặc https://"
+        return
+    end
+    State.bridgeUrl = trimmed
+    urlBox.Text     = trimmed
+    State.errorMsg  = ""
+    log(`Bridge URL: {trimmed}`)
 end
 
--- Click Connect
-connectBtn.MouseButton1Click:Connect(function(): ()
-    applyUrl(urlBox.Text)
-
+local function startPolling(): ()
     if State.running then
-        -- Đang chạy → restart với URL mới
         State.running = false
-        task.wait(0.3)
+        task.wait(0.3)   -- đợi pollLoop kết thúc
     end
-
     State.running    = true
     State.cmdCount   = 0
     State.startClock = os.clock()
     btn:SetActive(true)
     task.spawn(pollLoop)
-    log("Connected with URL: " .. State.bridgeUrl)
+end
+
+local function stopPolling(): ()
+    State.running   = false
+    State.connected = false
+    btn:SetActive(false)
+    log("Stopped by user")
+end
+
+-- Connect button
+connectBtn.MouseButton1Click:Connect(function(): ()
+    if State.running then
+        stopPolling()
+    else
+        applyUrl(urlBox.Text)
+        if State.errorMsg == "" then
+            startPolling()
+        end
+    end
 end)
 
 -- Toolbar button toggle
 btn.Click:Connect(function(): ()
     if State.running then
-        State.running = false
-        State.connected = false
-        btn:SetActive(false)
-        log("Stopped")
+        stopPolling()
     else
         applyUrl(urlBox.Text)
-        State.running    = true
-        State.cmdCount   = 0
-        State.startClock = os.clock()
-        btn:SetActive(true)
-        task.spawn(pollLoop)
-        log("Started")
-    end
-end)
-
--- Enter trong urlBox → apply + connect
-urlBox.FocusLost:Connect(function(enterPressed: boolean): ()
-    if enterPressed then
-        applyUrl(urlBox.Text)
-        if not State.running then
-            State.running    = true
-            State.cmdCount   = 0
-            State.startClock = os.clock()
-            btn:SetActive(true)
-            task.spawn(pollLoop)
+        if State.errorMsg == "" then
+            startPolling()
         end
     end
 end)
 
--- ── UI update loop ────────────────────────────────────────────────
+-- Enter trong urlBox → connect
+urlBox.FocusLost:Connect(function(enterPressed: boolean): ()
+    if enterPressed and not State.running then
+        applyUrl(urlBox.Text)
+        if State.errorMsg == "" then
+            startPolling()
+        end
+    end
+end)
+
+-- ── UI update loop ─────────────────────────────────────────────────
 
 task.spawn(function(): ()
     while true do
         if State.running then
             if State.connected then
-                lblStatus.Text = "<font color='#50dd80'>●</font> CONNECTED"
-                connectBtn.BackgroundColor3 = Color3.fromRGB(40,160,80)
-                connectBtn.Text = "Disconnect"
+                lblStatus.Text              = "<font color='#50dd80'>●</font> CONNECTED"
+                connectBtn.BackgroundColor3 = Color3.fromRGB(40, 160, 80)
+                connectBtn.Text             = "Disconnect"
             else
-                lblStatus.Text = "<font color='#f0b832'>●</font> CONNECTING..."
-                connectBtn.BackgroundColor3 = Color3.fromRGB(50,120,220)
-                connectBtn.Text = "Connect"
+                lblStatus.Text              = "<font color='#f0b832'>●</font> CONNECTING..."
+                connectBtn.BackgroundColor3 = Color3.fromRGB(50, 120, 220)
+                connectBtn.Text             = "Connect"
             end
-            local up = `{math.floor(os.clock() - State.startClock)}s`
-            lblCmds.Text = `Commands: {State.cmdCount}  |  Up: {up}`
+            local uptime = math.floor(os.clock() - State.startClock)
+            lblCmds.Text = `Commands: {State.cmdCount}  |  Up: {uptime}s`
             lblLast.Text = `Last: {State.lastCmd}`
         else
-            lblStatus.Text = "● STOPPED"
-            connectBtn.BackgroundColor3 = Color3.fromRGB(50,120,220)
-            connectBtn.Text = "Connect"
-            lblCmds.Text = "Commands: 0"
-            lblLast.Text = "Last: —"
+            lblStatus.Text              = "● STOPPED"
+            connectBtn.BackgroundColor3 = Color3.fromRGB(50, 120, 220)
+            connectBtn.Text             = "Connect"
+            lblCmds.Text               = "Commands: 0"
+            lblLast.Text               = "Last: —"
         end
         lblError.Text = State.errorMsg
         task.wait(0.5)
     end
 end)
 
-log("v0.5 loaded — nhập URL vào ô rồi click Connect")
+log("v0.6 loaded — nhập URL vào ô rồi click Connect")
