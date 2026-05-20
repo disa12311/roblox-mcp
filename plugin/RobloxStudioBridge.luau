@@ -1,6 +1,6 @@
 --!strict
 --[[
-    RobloxMCP Plugin v0.6 — Luau strict
+    Roblox Studio Bridge Plugin v0.6 — Luau strict
     Kết nối Roblox Studio với Claude qua MCP server
 
     Cải tiến v0.6:
@@ -11,9 +11,9 @@
     - Tách constants ra đầu file cho dễ config
 
     Cài đặt:
-    1. Copy vào: %LOCALAPPDATA%\Roblox\Plugins\RobloxMCP.luau
+    1. Copy vào: %LOCALAPPDATA%\Roblox\Plugins\RobloxStudioBridge.luau
     2. Bật: Game Settings → Security → Allow HTTP Requests ✓
-    3. Chạy roblox-mcp.exe, copy URL hiện ra
+    3. Chạy roblox-studio-bridge.exe, copy URL hiện ra
     4. Paste URL vào ô trong widget, click Connect
 --]]
 
@@ -338,14 +338,14 @@ end
 
 -- ── UI ─────────────────────────────────────────────────────────────
 
-local toolbar = plugin_env:CreateToolbar("Claude MCP")
-local btn     = toolbar:CreateButton("MCP", "Bật/tắt Claude MCP", "")
+local toolbar = plugin_env:CreateToolbar("Studio Bridge")
+local btn     = toolbar:CreateButton("Bridge", "Bật/tắt Studio Bridge", "")
 
 local widgetInfo = DockWidgetPluginGuiInfo.new(
     Enum.InitialDockState.Bottom, true, false, 420, 260, 340, 220
 )
-local widget = plugin_env:CreateDockWidgetPluginGui("RobloxMCP_v6", widgetInfo)
-widget.Title = "Claude MCP"
+local widget = plugin_env:CreateDockWidgetPluginGui("StudioBridge_v6", widgetInfo)
+widget.Title = "Studio Bridge"
 
 -- Root frame
 local root = Instance.new("Frame")

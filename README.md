@@ -1,4 +1,4 @@
-# Roblox Studio MCP Server
+# Roblox Studio Bridge
 
 Kết nối Claude web (claude.ai) với Roblox Studio — điều khiển game trực tiếp từ chat.
 
@@ -12,11 +12,12 @@ claude.ai (web)
 Cloudflare Quick Tunnel
 (https://xxxx.trycloudflare.com)
     ↕
-roblox-mcp.exe
+roblox-studio-bridge.exe
+├── GUI Window (egui)       ← Log console, trạng thái kết nối, copy URL
 ├── MCP HTTP Server  :3000  ← Claude kết nối vào
 └── Bridge Server    :7878  ← Plugin kết nối vào
     ↕ HTTP long-poll
-RobloxMCP.luau (Plugin trong Roblox Studio)
+RobloxStudioBridge.luau (Plugin trong Roblox Studio)
     ↕
 Roblox DataModel
 ```
@@ -26,14 +27,16 @@ Roblox DataModel
 ## Cấu trúc project
 
 ```
-roblox-mcp/
+roblox-studio-bridge/
 ├── src/
-│   ├── main.rs         — Entry point, CLI output
+│   ├── main.rs         — Entry point, egui GUI
 │   ├── bridge.rs       — HTTP server nhận lệnh từ plugin (port 7878)
 │   ├── http_server.rs  — MCP HTTP server cho Claude (port 3000)
 │   └── tunnel.rs       — Cloudflare Quick Tunnel
 ├── plugin/
-│   └── RobloxMCP.luau  — Plugin Roblox Studio (Luau strict)
+│   └── RobloxStudioBridge.luau  — Plugin Roblox Studio (Luau strict)
+├── tools/
+│   └── luau_to_rbxmx.py         — Tool chuyển .luau → .rbxmx
 ├── .cargo/
 │   └── config.toml     — Cross-compile Windows GNU target
 ├── Cargo.toml
@@ -56,7 +59,8 @@ Tải tại: https://github.com/cloudflare/cloudflared/releases/latest
 
 - File cần tải: `cloudflared-windows-amd64.exe`
 - Đổi tên thành: `cloudflared.exe`
-- Đặt **cùng thư mục** với `roblox-mcp.exe`
+- Đặt **cùng thư mục** với `roblox-studio-bridge.exe`
+- Hoặc cài system-wide: `winget install Cloudflare.cloudflared`
 
 ---
 
@@ -68,13 +72,13 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 Binary sau khi build:
 ```
-target\x86_64-pc-windows-gnu\release\roblox-mcp.exe
+target\x86_64-pc-windows-gnu\release\roblox-studio-bridge.exe
 ```
 
 Copy 2 file vào cùng 1 thư mục:
 ```
 📁 bất kỳ
-├── roblox-mcp.exe
+├── roblox-studio-bridge.exe
 └── cloudflared.exe
 ```
 
@@ -82,13 +86,20 @@ Copy 2 file vào cùng 1 thư mục:
 
 ## Cài plugin vào Roblox Studio
 
-**Copy file plugin:**
+### Cách 1 — Copy file Luau (đơn giản nhất)
 ```
-plugin\RobloxMCP.luau
-→ %LOCALAPPDATA%\Roblox\Plugins\RobloxMCP.luau
+plugin\RobloxStudioBridge.luau
+→ %LOCALAPPDATA%\Roblox\Plugins\RobloxStudioBridge.luau
 ```
 
-**Bật HTTP trong Studio:**
+### Cách 2 — Dùng file .rbxmx (import vào Studio)
+```powershell
+python tools\luau_to_rbxmx.py plugin\RobloxStudioBridge.luau --name RobloxStudioBridge
+# → tạo ra plugin\RobloxStudioBridge.rbxmx
+```
+Sau đó mở Studio → **File → Open** → chọn file `.rbxmx`
+
+**Bật HTTP trong Studio (bắt buộc):**
 ```
 Game Settings → Security → Allow HTTP Requests ✓
 ```
@@ -98,35 +109,33 @@ Game Settings → Security → Allow HTTP Requests ✓
 ## Chạy
 
 ```powershell
-.\roblox-mcp.exe
+.\roblox-studio-bridge.exe
 ```
 
-Output khi khởi động thành công:
+Cửa sổ GUI mở ra:
 
 ```
-╔══════════════════════════════════════════╗
-║     Roblox Studio MCP Server v0.1        ║
-╚══════════════════════════════════════════╝
-
-  ✓  MCP port    localhost:3000
-  ✓  Bridge      localhost:7878
-  ✓  Tunnel      Quick (URL random — thay đổi mỗi lần restart)
-
-  ⟳ Đang khởi động...
-
-┌──────────────────────────────────────────┐
-│              ✅  READY                    │
-├──────────────────────────────────────────┤
-│  Public URL: https://xxxx.trycloudflare.com  │
-│  Bridge:     localhost:7878              │
-├──────────────────────────────────────────┤
-│  Thêm vào claude.ai:                     │
-│  Settings → Connectors → Add custom      │
-└──────────────────────────────────────────┘
-
-  → Ctrl+C để dừng
-  ◉ Chờ Roblox Studio plugin kết nối...
+┌─ Roblox Studio Bridge  v0.2 ─────────── ● waiting  [url]  [⎘ copy] ─┐
+│                                                                        │
+│  00:00:01  Roblox Studio Bridge  v0.2                                 │
+│  ─────────────────────────────────────────────────                    │
+│  00:00:01  MCP port   →  localhost:3000                               │
+│  00:00:01  Bridge     →  localhost:7878                               │
+│  00:00:01  Bridge server  localhost:7878                              │
+│  00:00:01  MCP server     localhost:3000                              │
+│  ─────────────────────────────────────────────────                    │
+│  00:00:02  ✅  READY                                                  │
+│  00:00:02  https://xxxx.trycloudflare.com                             │
+│  ─────────────────────────────────────────────────                    │
+│  00:00:15  Plugin Roblox Studio đã kết nối                            │
+│                                                                        │
+├── ● plugin online  │  mcp :3000  bridge :7878  ──── [⬇ auto] ────────┤
+└────────────────────────────────────────────────────────────────────────┘
 ```
+
+- **Header**: dot màu trạng thái + URL tunnel + nút **⎘ copy** để copy URL vào clipboard
+- **Log**: timestamp `HH:MM:SS` + text màu theo loại (info / success / warn / error)
+- **Status bar**: plugin online/offline, ports, toggle auto-scroll
 
 > ⚠️ **URL thay đổi mỗi lần restart** — phải cập nhật lại connector trong claude.ai.
 
@@ -134,16 +143,16 @@ Output khi khởi động thành công:
 
 ## Thêm connector vào claude.ai
 
-1. Copy URL từ terminal (dạng `https://xxxx.trycloudflare.com`)
+1. Click **⎘ copy** trong cửa sổ để copy URL tunnel
 2. Vào **claude.ai → Settings → Connectors → Add custom connector**
 3. Dán URL vào → Save
-4. Khi chat: click `+` → **Connectors** → bật **Roblox Studio**
+4. Khi chat: click `+` → **Connectors** → bật **Roblox Studio Bridge**
 
 ---
 
 ## Kết nối plugin trong Studio
 
-Sau khi cài plugin, mở Studio sẽ thấy tab **"Claude MCP"** trong toolbar.
+Sau khi cài plugin, mở Studio sẽ thấy tab **"Studio Bridge"** trong toolbar.
 
 Widget hiện ra ở dưới màn hình:
 
@@ -152,15 +161,15 @@ Widget hiện ra ở dưới màn hình:
 Commands: 0
 Last: —
 ────────────────────────────────────
-Bridge URL (từ roblox-mcp.exe):
-┌──────────────────────────────┐ ┌──────────┐
-│ http://127.0.0.1:7878        │ │ Connect  │
-└──────────────────────────────┘ └──────────┘
+Bridge URL
+┌──────────────────────────────┐ ┌────────────┐
+│ http://127.0.0.1:7878        │ │  Connect   │
+└──────────────────────────────┘ └────────────┘
 Tip: snapshot() trả toàn bộ context 1 lần
 ```
 
 **Bridge URL là gì?**
-- Địa chỉ port 7878 của `roblox-mcp.exe` chạy trên máy bạn
+- Địa chỉ port 7878 của `roblox-studio-bridge.exe` chạy trên máy bạn
 - Mặc định `http://127.0.0.1:7878` — **không cần đổi** nếu chạy cùng máy
 - Chỉ đổi nếu chạy server trên máy khác trong LAN
 
@@ -173,19 +182,19 @@ Tip: snapshot() trả toàn bộ context 1 lần
 ## Thứ tự khởi động đúng
 
 ```
-Bước 1: Chạy roblox-mcp.exe
-        → Đợi hiện "READY" + URL
+Bước 1: Chạy roblox-studio-bridge.exe
+        → Đợi cửa sổ hiện "READY" + URL
 
-Bước 2: Copy URL → paste vào claude.ai
+Bước 2: Click ⎘ copy → paste vào claude.ai
         Settings → Connectors → Add custom connector
 
 Bước 3: Mở Roblox Studio + mở game bất kỳ
 
-Bước 4: Widget "Claude MCP" → click Connect
+Bước 4: Widget "Studio Bridge" → click Connect
         → Chờ hiện ● CONNECTED
 
 Bước 5: Chat trên claude.ai
-        → click + → Connectors → bật Roblox Studio
+        → click + → Connectors → bật Roblox Studio Bridge
 ```
 
 ---
@@ -200,9 +209,9 @@ Bước 5: Chat trên claude.ai
 | `batch_run([...])` | Chạy nhiều đoạn Luau tuần tự trong 1 lần gọi, trả JSON array kết quả | Nhiều thao tác cùng lúc |
 | `run_code(code)` | Chạy 1 đoạn Luau, trả output | Thao tác đơn lẻ |
 | `get_instances(path)` | Xem children của 1 object (ví dụ: `game.Workspace`) | Inspect cụ thể |
+| `get_scripts()` | Đọc tất cả scripts kèm toàn bộ source code | Review/debug code |
 | `insert_part(name, parent)` | Tạo Part mới | Tạo nhanh |
 | `insert_script(name, type, parent, source)` | Tạo Script/LocalScript/ModuleScript | Thêm logic |
-| `get_scripts()` | Đọc tất cả scripts kèm source code | Review/debug code |
 | `status()` | Kiểm tra kết nối plugin còn sống không | Debug |
 
 ### Flow tối ưu (ít token nhất)
@@ -240,6 +249,31 @@ Bước 5: Chat trên claude.ai
 
 ---
 
+## Tool: luau_to_rbxmx.py
+
+Chuyển đổi file `.luau` / `.lua` sang `.rbxmx` để import vào Roblox Studio.
+
+```powershell
+# 1 file → rbxmx cùng tên
+python tools\luau_to_rbxmx.py plugin\RobloxStudioBridge.luau
+
+# Chỉ định output
+python tools\luau_to_rbxmx.py plugin\RobloxStudioBridge.luau -o dist\plugin.rbxmx
+
+# Ép kiểu script
+python tools\luau_to_rbxmx.py foo.luau --type LocalScript
+
+# Nhiều file gộp vào 1 rbxmx
+python tools\luau_to_rbxmx.py a.luau b.luau --merge -o bundle.rbxmx
+```
+
+**Auto-detect loại script** theo thứ tự ưu tiên:
+1. Header comment trong file: `-- @type LocalScript`
+2. Suffix tên file: `foo.server.luau` → Script, `foo.client.luau` → LocalScript, `foo.module.luau` → ModuleScript
+3. Mặc định: `Script`
+
+---
+
 ## Cấu hình (Environment Variables)
 
 | Biến | Mặc định | Mô tả |
@@ -247,11 +281,10 @@ Bước 5: Chat trên claude.ai
 | `MCP_PORT` | `3000` | Port MCP HTTP server (Claude kết nối) |
 | `BRIDGE_PORT` | `7878` | Port Bridge (plugin kết nối) |
 
-Ví dụ đổi port:
 ```powershell
 $env:MCP_PORT    = "4000"
 $env:BRIDGE_PORT = "8888"
-.\roblox-mcp.exe
+.\roblox-studio-bridge.exe
 ```
 
 ---
@@ -281,8 +314,8 @@ curl https://xxxx.trycloudflare.com/health
 
 ### `cloudflared.exe` không tìm thấy
 ```
-Lỗi: Không tìm thấy cloudflared.exe cạnh roblox-mcp.exe
-Fix:  Đặt cloudflared.exe cùng thư mục với roblox-mcp.exe
+Fix: Đặt cloudflared.exe cùng thư mục với roblox-studio-bridge.exe
+     Hoặc: winget install Cloudflare.cloudflared
 ```
 
 ### Plugin hiện `● CONNECTING...` mãi
@@ -291,7 +324,7 @@ Fix:  Đặt cloudflared.exe cùng thư mục với roblox-mcp.exe
 curl http://127.0.0.1:7878/health
 # Phải trả: OK
 
-# Nếu không trả OK → roblox-mcp.exe chưa chạy hoặc đã crash
+# Nếu không trả OK → roblox-studio-bridge.exe chưa chạy hoặc đã crash
 ```
 
 ### claude.ai báo "Couldn't reach the MCP server"
@@ -300,14 +333,8 @@ curl http://127.0.0.1:7878/health
 curl https://xxxx.trycloudflare.com/health
 # Phải trả: OK
 
-# Nếu OK mà vẫn lỗi → thử xóa connector cũ, add lại với URL mới
-# URL thay đổi sau mỗi lần restart roblox-mcp.exe
-```
-
-### URL tunnel bị parse sai (hiện cloudflare.com thay vì trycloudflare.com)
-```
-Đây là bug đã được fix — chỉ accept URL dạng *.trycloudflare.com
-Rebuild lại binary là hết
+# Nếu OK mà vẫn lỗi → xóa connector cũ, add lại với URL mới
+# URL thay đổi sau mỗi lần restart roblox-studio-bridge.exe
 ```
 
 ### Studio không nhận lệnh dù plugin CONNECTED

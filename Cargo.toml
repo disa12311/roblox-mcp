@@ -1,10 +1,10 @@
 [package]
-name    = "roblox-mcp"
+name    = "roblox-studio-bridge"
 version = "0.2.0"
 edition = "2024"
 
 [[bin]]
-name = "roblox-mcp"
+name = "roblox-studio-bridge"
 path = "src/main.rs"
 
 [dependencies]

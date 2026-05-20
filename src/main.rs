@@ -171,7 +171,7 @@ impl eframe::App for McpApp {
 
                             ui.add_space(8.0);
 
-                            ui.label(RichText::new("Roblox Studio MCP")
+                            ui.label(RichText::new("Roblox Studio Bridge")
                                 .color(COL_INFO)
                                 .font(FontId::new(13.0, FontFamily::Monospace))
                                 .strong());
@@ -354,7 +354,7 @@ fn main() -> Result<()> {
     // egui window
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Roblox Studio MCP  v0.2")
+            .with_title("Roblox Studio Bridge  v0.2")
             .with_inner_size([680.0, 420.0])
             .with_min_inner_size([480.0, 280.0])
             .with_resizable(true),
@@ -362,7 +362,7 @@ fn main() -> Result<()> {
     };
 
     eframe::run_native(
-        "roblox-mcp",
+        "roblox-studio-bridge",
         options,
         Box::new(|cc| {
             // Font monospace mặc định egui đã có — chỉ cần tune visuals
@@ -388,13 +388,13 @@ async fn run_backend(config: Config, shared: Shared) {
     // (dùng tracing_subscriber đơn giản để không block; log qua closure)
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr) // fallback stderr, chủ yếu dùng push()
-        .with_env_filter("roblox_mcp=info,tower_http=warn")
+        .with_env_filter("roblox_studio_bridge=info,tower_http=warn")
         .with_ansi(false)
         .init();
 
     let p = |line: LogLine| push(&shared, line);
 
-    p(LogLine::dim("Roblox Studio MCP Server  v0.2"));
+    p(LogLine::dim("Roblox Studio Bridge  v0.2"));
     p(LogLine::sep());
 
     let c = config.clone();

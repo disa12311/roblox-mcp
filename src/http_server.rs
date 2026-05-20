@@ -115,7 +115,7 @@ async fn handle_post(
                     "tools": { "listChanged": false }
                 },
                 "serverInfo": {
-                    "name": "roblox-studio-mcp",
+                    "name": "roblox-studio-bridge",
                     "version": env!("CARGO_PKG_VERSION")
                 },
                 "instructions": concat!(
