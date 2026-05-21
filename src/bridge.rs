@@ -1,10 +1,4 @@
 /// bridge.rs — HTTP server local, long-poll cho Roblox Studio plugin
-///
-/// Cải tiến so với v0.1:
-/// - Dùng `tokio::sync::Notify` thay vì spin-poll 100×100ms → giảm CPU idle
-/// - Thêm `plugin_online: AtomicBool` để track trạng thái kết nối plugin
-/// - Tách `PendingSlot` thành struct riêng để dễ đọc hơn
-/// - Timeout logic gọn hơn với `select!`
 
 use anyhow::Result;
 use axum::{
@@ -15,7 +9,11 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}},
+    time::Duration,
+};
 use tokio::sync::{oneshot, Mutex, Notify};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -25,18 +23,12 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CommandKind {
-    /// Chạy Luau code tùy ý
-    RunCode { code: String },
-    /// Lấy children của một path
+    RunCode      { code: String },
     GetInstances { path: String },
-    /// Tạo Part mới
-    InsertPart { name: String, parent: String },
-    /// Lấy tất cả scripts kèm source
-    GetScripts {},
-    /// Snapshot toàn bộ game state — 1 lần trả hết context
-    Snapshot {},
-    /// Chạy nhiều đoạn code tuần tự, trả từng kết quả
-    BatchRun { codes: Vec<String> },
+    InsertPart   { name: String, parent: String },
+    GetScripts   {},
+    Snapshot     {},
+    BatchRun     { codes: Vec<String> },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -54,21 +46,29 @@ pub struct CommandResult {
 
 // ── Shared state ──────────────────────────────────────────────────
 
-/// Toàn bộ state chia sẻ giữa bridge server và MCP server.
 #[derive(Clone)]
 pub struct BridgeState {
     inner: Arc<BridgeInner>,
 }
 
 struct BridgeInner {
-    /// Lệnh đang chờ plugin nhận — None nếu chưa có lệnh mới.
-    pending: Mutex<Option<PendingCommand>>,
-    /// Notify để /poll biết khi có lệnh mới (thay vì spin-poll).
+    pending:        Mutex<Option<PendingCommand>>,
     pending_notify: Notify,
-    /// Map id → sender để trả kết quả về caller.
-    waiters: Mutex<HashMap<String, oneshot::Sender<CommandResult>>>,
-    /// Plugin có đang kết nối không (dùng cho status hiển thị).
-    pub plugin_online: AtomicBool,
+    waiters:        Mutex<HashMap<String, oneshot::Sender<CommandResult>>>,
+    /// true khi plugin đang kết nối
+    plugin_online:  AtomicBool,
+    /// Unix timestamp (giây) của lần cuối plugin gọi /poll hoặc /health
+    last_seen_secs: AtomicU64,
+}
+
+/// Plugin được coi là offline nếu không thấy trong 15 giây
+const OFFLINE_TIMEOUT_SECS: u64 = 15;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 impl BridgeState {
@@ -79,6 +79,7 @@ impl BridgeState {
                 pending_notify: Notify::new(),
                 waiters:        Mutex::new(HashMap::new()),
                 plugin_online:  AtomicBool::new(false),
+                last_seen_secs: AtomicU64::new(0),
             }),
         }
     }
@@ -88,15 +89,8 @@ impl BridgeState {
         let id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
 
-        {
-            let mut waiters = self.inner.waiters.lock().await;
-            waiters.insert(id.clone(), tx);
-        }
-        {
-            let mut pending = self.inner.pending.lock().await;
-            *pending = Some(PendingCommand { id: id.clone(), kind });
-        }
-        // Notify /poll handler đang chờ
+        self.inner.waiters.lock().await.insert(id.clone(), tx);
+        *self.inner.pending.lock().await = Some(PendingCommand { id: id.clone(), kind });
         self.inner.pending_notify.notify_one();
 
         match tokio::time::timeout(Duration::from_secs(30), rx).await {
@@ -104,7 +98,6 @@ impl BridgeState {
             Ok(Ok(r))              => anyhow::bail!("Studio error: {}", r.output),
             Ok(Err(_))             => anyhow::bail!("Channel closed unexpectedly"),
             Err(_) => {
-                // Cleanup khi timeout
                 self.inner.waiters.lock().await.remove(&id);
                 self.inner.pending.lock().await.take();
                 anyhow::bail!("Timeout: Studio plugin không phản hồi trong 30s")
@@ -112,45 +105,47 @@ impl BridgeState {
         }
     }
 
-    /// Kiểm tra plugin có đang online không.
+    /// Tính lại online dựa trên last_seen — gọi từ monitor task.
+    pub fn refresh_online_status(&self) {
+        let elapsed = now_secs().saturating_sub(
+            self.inner.last_seen_secs.load(Ordering::Relaxed)
+        );
+        let online = elapsed < OFFLINE_TIMEOUT_SECS
+            && self.inner.last_seen_secs.load(Ordering::Relaxed) != 0;
+        self.inner.plugin_online.store(online, Ordering::Relaxed);
+    }
+
     pub fn is_plugin_online(&self) -> bool {
         self.inner.plugin_online.load(Ordering::Relaxed)
+    }
+
+    fn touch(&self) {
+        self.inner.last_seen_secs.store(now_secs(), Ordering::Relaxed);
+        self.inner.plugin_online.store(true, Ordering::Relaxed);
     }
 }
 
 // ── HTTP handlers ─────────────────────────────────────────────────
 
-/// GET /poll — Plugin gọi liên tục để nhận lệnh mới.
-///
-/// Thay vì spin 100×100ms, dùng `Notify::notified()` wait + timeout 10s.
-/// CPU gần như 0% khi idle, phản hồi < 1ms khi có lệnh.
 async fn handle_poll(State(s): State<BridgeState>) -> impl IntoResponse {
-    s.inner.plugin_online.store(true, Ordering::Relaxed);
+    s.touch();
 
-    // Trả ngay nếu đang có lệnh chờ
     if let Some(cmd) = s.inner.pending.lock().await.take() {
         debug!("→ plugin (immediate): {}", cmd.id);
         return (StatusCode::OK, Json(Some(cmd))).into_response();
     }
 
-    // Chờ tối đa 10s cho lệnh tiếp theo — không spin
     let notified = s.inner.pending_notify.notified();
     match tokio::time::timeout(Duration::from_secs(10), notified).await {
         Ok(()) => {
             let cmd = s.inner.pending.lock().await.take();
-            if let Some(ref c) = cmd {
-                debug!("→ plugin (notified): {}", c.id);
-            }
+            if let Some(ref c) = cmd { debug!("→ plugin (notified): {}", c.id); }
             (StatusCode::OK, Json(cmd)).into_response()
         }
-        Err(_) => {
-            // Long-poll timeout bình thường — plugin poll lại
-            (StatusCode::OK, Json::<Option<PendingCommand>>(None)).into_response()
-        }
+        Err(_) => (StatusCode::OK, Json::<Option<PendingCommand>>(None)).into_response(),
     }
 }
 
-/// POST /result — Plugin gửi kết quả lệnh về.
 async fn handle_result(
     State(s): State<BridgeState>,
     Json(r): Json<CommandResult>,
@@ -158,20 +153,13 @@ async fn handle_result(
     debug!("← plugin: {} ok={}", r.id, r.success);
     let mut waiters = s.inner.waiters.lock().await;
     match waiters.remove(&r.id) {
-        Some(tx) => {
-            let _ = tx.send(r);
-            StatusCode::OK
-        }
-        None => {
-            warn!("Không tìm thấy waiter cho id={}", r.id);
-            StatusCode::NOT_FOUND
-        }
+        Some(tx) => { let _ = tx.send(r); StatusCode::OK }
+        None     => { warn!("Không tìm thấy waiter cho id={}", r.id); StatusCode::NOT_FOUND }
     }
 }
 
-/// GET /health — Plugin dùng để kiểm tra bridge còn sống.
 async fn handle_health(State(s): State<BridgeState>) -> impl IntoResponse {
-    s.inner.plugin_online.store(true, Ordering::Relaxed);
+    s.touch();
     (StatusCode::OK, "OK")
 }
 
