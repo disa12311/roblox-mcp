@@ -100,8 +100,6 @@ struct SharedState {
     ready:         bool,
     error:         Option<String>,
     auto_copy_url: Option<String>,
-    /// Set true khi user click "Thoát" trong tray menu
-    should_quit:   bool,
 }
 
 type Shared = Arc<Mutex<SharedState>>;
@@ -131,8 +129,6 @@ struct McpApp {
     last_online:      bool,
     scroll_to_bottom: bool,
     toast:            Option<Toast>,
-    /// Minimized to tray
-    hidden:           bool,
 }
 
 impl McpApp {
@@ -142,7 +138,6 @@ impl McpApp {
             last_online:      false,
             scroll_to_bottom: true,
             toast:            None,
-            hidden:           false,
         }
     }
 
@@ -183,18 +178,9 @@ impl eframe::App for McpApp {
             self.last_online = now_online;
         }
 
-        // ── Close / minimize to tray ──────────────────────────────
-        let should_quit = self.shared.lock().unwrap().should_quit;
-        if should_quit {
-            // User click "Thoát" trong tray menu → thoát thật
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
+        // ── Close ─────────────────────────────────────────────────
         if ctx.input(|i| i.viewport().close_requested()) {
-            // Click X → minimize xuống tray, không thoát
-            self.hidden = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            std::process::exit(0);
         }
 
         // ── Expire toast ──────────────────────────────────────────
@@ -237,6 +223,13 @@ impl eframe::App for McpApp {
                                 .font(FontId::new(11.0, FontFamily::Monospace)));
 
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                // Nút minimize window
+                                if ui.small_button(
+                                    RichText::new("─").color(COL_DIM).size(13.0)
+                                ).on_hover_text("Thu nhỏ cửa sổ").clicked() {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                                }
+                                ui.add_space(4.0);
                                 if let Some(ref url) = state.tunnel_url {
                                     if ui.small_button(
                                         RichText::new("⎘ copy").color(COL_DIM).size(11.0)
@@ -337,12 +330,11 @@ impl eframe::App for McpApp {
                                 .font(FontId::new(11.0, FontFamily::Monospace)));
 
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                // Minimize to tray button
+                                // Quit button
                                 if ui.small_button(
-                                    RichText::new("⬇ tray").color(COL_DIM).size(10.0)
-                                ).on_hover_text("Minimize to system tray").clicked() {
-                                    self.hidden = true;
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                                    RichText::new("✕ quit").color(COL_DIM).size(10.0)
+                                ).on_hover_text("Thoát khỏi ứng dụng").clicked() {
+                                    std::process::exit(0);
                                 }
                                 ui.add_space(4.0);
                                 let scroll_icon = if self.scroll_to_bottom { "⬇ auto" } else { "⬇ manual" };
@@ -416,10 +408,6 @@ fn main() -> Result<()> {
             .block_on(run_backend(config_bg, shared_bg));
     });
 
-    // System tray
-    let tray_ctx = shared.clone();
-    let _tray    = build_tray(tray_ctx);
-
     // egui window
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -447,66 +435,6 @@ fn main() -> Result<()> {
     ).map_err(|e| anyhow::anyhow!("eframe: {e}"))?;
 
     Ok(())
-}
-
-// ── System tray ───────────────────────────────────────────────────
-
-fn build_tray(shared: Shared) -> Option<tray_icon::TrayIcon> {
-    use tray_icon::{
-        TrayIconBuilder,
-        menu::{Menu, MenuItem, MenuEvent},
-    };
-
-    let icon = {
-        let size = 16usize;
-        let mut rgba = vec![0u8; size * size * 4];
-        for y in 0..size {
-            for x in 0..size {
-                let i  = (y * size + x) * 4;
-                let dx = x as i32 - size as i32 / 2;
-                let dy = y as i32 - size as i32 / 2;
-                let r  = (size as i32 / 2 - 1).pow(2);
-                if dx * dx + dy * dy < r {
-                    rgba[i]     = 48;
-                    rgba[i + 1] = 210;
-                    rgba[i + 2] = 140;
-                    rgba[i + 3] = 255;
-                }
-            }
-        }
-        tray_icon::Icon::from_rgba(rgba, size as u32, size as u32).ok()?
-    };
-
-    let quit_item = MenuItem::new("Thoát", true, None);
-    let quit_id   = quit_item.id().clone();
-
-    let menu = Menu::new();
-    menu.append(&MenuItem::new("Roblox Studio Bridge", false, None)).ok();
-    menu.append(&tray_icon::menu::PredefinedMenuItem::separator()).ok();
-    menu.append(&quit_item).ok();
-
-    let tray = TrayIconBuilder::new()
-        .with_icon(icon)
-        .with_tooltip("Roblox Studio Bridge")
-        .with_menu(Box::new(menu))
-        .build()
-        .ok()?;
-
-    // Thread lắng nghe menu events
-    std::thread::spawn(move || {
-        let receiver = MenuEvent::receiver();
-        loop {
-            if let Ok(event) = receiver.recv() {
-                if event.id == quit_id {
-                    if let Ok(mut s) = shared.lock() {
-                        s.should_quit = true;
-                    }
-                }
-            }
-        }
-    });
-
-    Some(tray)
 }
 
 // ── Backend ───────────────────────────────────────────────────────
