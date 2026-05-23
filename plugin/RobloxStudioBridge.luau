@@ -284,7 +284,7 @@ local function pollLoop(): ()
 
     while State.running do
         -- Health check
-        local healthOk = pcall(HttpService.GetAsync, HttpService, bridgeUrl("/health"), true)
+        local healthOk = pcall(HttpService.GetAsync, HttpService, bridgeUrl("/health"), false)
         if not healthOk then
             State.connected = false
             State.errorMsg  = "Server không phản hồi — kiểm tra URL"
@@ -295,7 +295,7 @@ local function pollLoop(): ()
         State.errorMsg  = ""
 
         -- Poll lệnh
-        local pollOk, resp = pcall(HttpService.GetAsync, HttpService, bridgeUrl("/poll"), true)
+        local pollOk, resp = pcall(HttpService.GetAsync, HttpService, bridgeUrl("/poll"), false)
         if not pollOk then
             State.connected = false
             State.errorMsg  = `Poll error: {tostring(resp)}`

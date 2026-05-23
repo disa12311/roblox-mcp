@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="https://raw.githubusercontent.com/MaximumADHD/Roblox-Client-Tracker/roblox/Mini-Schema.xsd" version="4">
 
-	<Item class="Script" referent="RBXEFEC00D92B4C445FB24870ED79D4DF95">
+	<Item class="Script" referent="RBX601B8C5AFB364AAFAF5EB0A1AC3D1B8F">
 		<Properties>
 			<string name="Name">RobloxStudioBridge</string>
 			<ProtectedString name="Source">
@@ -291,7 +291,7 @@ local function pollLoop(): ()
 
     while State.running do
         -- Health check
-        local healthOk = pcall(HttpService.GetAsync, HttpService, bridgeUrl("/health"), true)
+        local healthOk = pcall(HttpService.GetAsync, HttpService, bridgeUrl("/health"), false)
         if not healthOk then
             State.connected = false
             State.errorMsg  = "Server không phản hồi — kiểm tra URL"
@@ -302,7 +302,7 @@ local function pollLoop(): ()
         State.errorMsg  = ""
 
         -- Poll lệnh
-        local pollOk, resp = pcall(HttpService.GetAsync, HttpService, bridgeUrl("/poll"), true)
+        local pollOk, resp = pcall(HttpService.GetAsync, HttpService, bridgeUrl("/poll"), false)
         if not pollOk then
             State.connected = false
             State.errorMsg  = `Poll error: {tostring(resp)}`
