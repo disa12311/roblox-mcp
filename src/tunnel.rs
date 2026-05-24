@@ -88,28 +88,45 @@ pub async fn start_tunnel(
     let cf   = find_cloudflared()?;
     let port = config.mcp_port;
 
+    if let Some(ref token) = config.cf_tunnel_token {
+        // ── Named tunnel — URL cố định, không cần parse stdout ────
+        info!("Starting Named Tunnel");
+        let mut child = tokio::process::Command::new(&cf)
+            .args(["tunnel", "--no-autoupdate", "run", "--token", token])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("Failed to spawn cloudflared named tunnel")?;
+
+        // Named tunnel URL được cấu hình trên Cloudflare dashboard
+        // App không biết URL — trả placeholder để user điền
+        let url = format!("(named tunnel — xem dashboard.cloudflare.com)");
+        let (tx, rx) = watch::channel::<Option<String>>(Some(url.clone()));
+
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+            let _ = tx.send(None);
+        });
+
+        return Ok((url, rx));
+    }
+
+    // ── Quick tunnel ──────────────────────────────────────────────
     info!("Starting Quick Tunnel → http://localhost:{port}");
     let (url, child) = spawn_tunnel(&cf, port).await?;
-
     let (tx, rx) = watch::channel::<Option<String>>(Some(url.clone()));
 
-    // Auto-restart task
     tokio::spawn(async move {
         let mut current_child = child;
         loop {
-            // Chờ process kết thúc
             match current_child.wait().await {
                 Ok(status) => warn!("cloudflared exited: {status}"),
                 Err(e)     => warn!("cloudflared wait error: {e}"),
             }
-
-            // Báo tunnel đang offline
             let _ = tx.send(None);
-
-            // Đợi 3s rồi restart
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             info!("Restarting cloudflared tunnel…");
-
             match spawn_tunnel(&cf, port).await {
                 Ok((new_url, new_child)) => {
                     info!("Tunnel restarted: {new_url}");
@@ -118,12 +135,7 @@ pub async fn start_tunnel(
                 }
                 Err(e) => {
                     warn!("Failed to restart tunnel: {e}");
-                    // Retry sau 10s
-                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                    // Gửi None lại để UI biết vẫn đang lỗi
-                    let _ = tx.send(None);
-                    // Tạo dummy child để loop tiếp — không ideal nhưng đơn giản
-                    break; // Thoát loop, tunnel sẽ không restart nữa nếu lỗi liên tục
+                    break;
                 }
             }
         }
